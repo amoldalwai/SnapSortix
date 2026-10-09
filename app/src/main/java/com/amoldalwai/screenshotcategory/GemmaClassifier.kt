@@ -1,0 +1,271 @@
+package com.amoldalwai.screenshotcategory
+
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.content.Context
+import android.net.Uri
+import com.google.ai.edge.litertlm.Backend
+import com.google.ai.edge.litertlm.Content
+import com.google.ai.edge.litertlm.ConversationConfig
+import com.google.ai.edge.litertlm.Contents
+import com.google.ai.edge.litertlm.Engine
+import com.google.ai.edge.litertlm.EngineConfig
+import com.google.ai.edge.litertlm.ExperimentalApi
+import com.google.ai.edge.litertlm.ExperimentalFlags
+import com.google.ai.edge.litertlm.ThinkingConfig
+import java.io.File
+import java.io.FileOutputStream
+
+@OptIn(ExperimentalApi::class)
+class GemmaClassifier(private val context: Context, private val modelFile: File) {
+    private var engine: Engine? = null
+
+    fun warmUp() {
+        getOrCreateEngine()
+    }
+
+    fun classify(uri: Uri, categories: List<String>, customPrompt: String): Classification {
+        val imageFile = preprocessImageForVision(uri)
+        val activeEngine = getOrCreateEngine()
+
+        return activeEngine.createConversation(
+            ConversationConfig(
+                thinkingConfig = ThinkingConfig(enableThinking = false, thinkingTokenBudget = 0),
+                maxOutputToken = 64
+            )
+        ).use { conversation ->
+            val response = conversation.sendMessage(
+                Contents.of(
+                    Content.ImageFile(imageFile.absolutePath),
+                    Content.Text(buildClassificationPrompt(categories, customPrompt))
+                )
+            ).contents.contents
+                .filterIsInstance<Content.Text>()
+                .joinToString(separator = "") { it.text }
+            Classification.fromModelResponse(response, categories)
+        }
+    }
+
+    fun close() {
+        engine?.close()
+        engine = null
+    }
+
+    private fun getOrCreateEngine(): Engine {
+        engine?.let { return it }
+        ExperimentalFlags.enableSpeculativeDecoding = false
+
+        val gpuVisionConfig = EngineConfig(
+            modelPath = modelFile.absolutePath,
+            backend = Backend.CPU(),
+            visionBackend = Backend.GPU(),
+            cacheDir = context.cacheDir.absolutePath
+        )
+        val cpuFallbackConfig = EngineConfig(
+            modelPath = modelFile.absolutePath,
+            backend = Backend.CPU(),
+            visionBackend = Backend.CPU(),
+            cacheDir = context.cacheDir.absolutePath
+        )
+
+        return runCatching {
+            Engine(gpuVisionConfig).also { it.initialize() }
+        }.recoverCatching {
+            Engine(cpuFallbackConfig).also { it.initialize() }
+        }.getOrThrow().also {
+            engine = it
+        }
+    }
+
+    private fun buildClassificationPrompt(categories: List<String>, customPrompt: String): String = buildString {
+        appendLine("You classify one screenshot into exactly one allowed category.")
+        appendLine()
+        appendLine("Allowed categories: ${categories.joinToString(", ")}")
+        appendLine()
+        appendLine("Category definitions:")
+        categories.forEach { category ->
+            appendLine("- $category: ${categoryDefinition(category)}")
+        }
+        appendLine()
+        appendLine("Rules:")
+        appendLine("1. Return exactly one category from the allowed list, preserving its spelling.")
+        appendLine("2. Choose the most specific matching category. Use Others only when no other category fits.")
+        appendLine("3. Prioritize meaningful readable text and the primary subject over background scenery.")
+
+        categories.findCategory("Quotes/Learning")?.let { quotesCategory ->
+            appendLine(
+                "4. Choose $quotesCategory when the primary content is a quote, lesson, educational text, " +
+                    "study material, tutorial, or explanation. Do this even if it was shared on a social-media app."
+            )
+        }
+        categories.findCategory("Only people no text", "People")?.let { peopleCategory ->
+            appendLine(
+                "5. Choose $peopleCategory when people are the primary subject and there is no meaningful " +
+                    "text that clearly fits another category. Ignore tiny incidental text like watermarks, " +
+                    "status-bar labels, camera overlays, or single-word UI labels."
+            )
+        }
+        categories.findCategory("QR")?.let { qrCategory ->
+            appendLine("6. Choose $qrCategory when a QR code is clearly visible, even when other content is present.")
+        }
+        categories.findCategory("Maps")?.let { mapsCategory ->
+            appendLine("7. Choose $mapsCategory when a map or navigation interface is visible.")
+        }
+        categories.findCategory("Payment/Finance/Bills")?.let { financeCategory ->
+            appendLine(
+                "8. Choose $financeCategory for payment, banking, invoices, bills, balances, or transactions " +
+                    "when they are the main content."
+            )
+        }
+        categories.findCategory("Comment Section (YouTube / Instagram)")?.let { commentsCategory ->
+            appendLine(
+                "9. Choose $commentsCategory only when an actual comment thread is visible, such as multiple " +
+                    "comments or replies with user names, avatars, timestamps, likes, or reply controls. Do not " +
+                    "choose it for a standalone quote, caption, post, or image just because it came from YouTube or Instagram."
+            )
+        }
+        categories.findCategory("Greeting Messages (Good morning etc)")?.let { greetingCategory ->
+            appendLine("10. Choose $greetingCategory when greeting, blessing, festival, or good-morning text is the main content.")
+        }
+        categories.findCategory("Nature/Plants")?.let { natureCategory ->
+            appendLine("11. Choose $natureCategory only when nature is the primary subject and no person is present.")
+        }
+        appendLine("12. Custom instructions below override these baseline rules when they conflict.")
+        appendLine()
+        appendLine("Custom instructions: ${customPrompt.trim().ifBlank { "None" }}")
+        appendLine()
+        appendLine("13. Also provide a very short plain-language description of the screenshot in at most 12 words.")
+        append("Return JSON only, with no explanation: {\"category\":\"${categories.first()}\",\"confidence\":0.0,\"description\":\"brief summary\"}")
+    }
+
+    private fun List<String>.findCategory(vararg names: String): String? = firstOrNull { category ->
+        names.any { category.equals(it, ignoreCase = true) }
+    }
+
+    private fun categoryDefinition(category: String): String = when (category.lowercase()) {
+        "linkedin" -> "LinkedIn posts, profiles, jobs, professional updates, or workplace content."
+        "quotes/learning" -> "Quotes, study material, educational notes, tutorials, or useful explanations."
+        "food" -> "Meals, recipes, restaurant menus, cooking, or food and drink products."
+        "payment/finance/bills" -> "Payments, banking, invoices, bills, balances, transactions, or financial notices."
+        "identity cards" -> "Official identity documents such as Aadhaar cards, PAN cards, voter IDs, passports, driving licences, or similar IDs."
+        "qr" -> "A QR code intended to be scanned."
+        "comment section (youtube / instagram)" -> "YouTube, Instagram, or other social-media comments, replies, or discussions."
+        "nature/plants" -> "Plants, landscapes, flowers, outdoor scenery, or other nature-focused images."
+        "only people no text" -> "People are the main subject. Small incidental text is okay, but do not use this when meaningful text should drive another category."
+        "games (bgmi etc)" -> "Game play, game menus, scores, game characters, or gaming-related content."
+        "maps" -> "Maps, directions, navigation, routes, or location interfaces."
+        "greeting messages (good morning etc)" -> "Greeting, blessing, festival, good-morning, or good-night messages."
+        "animals" -> "Animals are the primary subject."
+        "others" -> "Anything that does not fit another category."
+        else -> "Content that best matches the category name: $category."
+    }
+
+    private fun preprocessImageForVision(uri: Uri): File {
+        val decoded = decodeDownscaledBitmap(uri, MAX_IMAGE_LONG_SIDE)
+        if (decoded == null) {
+            return copyOriginalToCache(uri)
+        }
+
+        val destination = File.createTempFile("screenshot-", ".jpg", context.cacheDir)
+        FileOutputStream(destination).use { output ->
+            decoded.compress(Bitmap.CompressFormat.JPEG, 90, output)
+        }
+        decoded.recycle()
+        return destination
+    }
+
+    private fun decodeDownscaledBitmap(uri: Uri, maxLongSide: Int): Bitmap? {
+        val boundsOptions = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        context.contentResolver.openInputStream(uri)?.use { input ->
+            BitmapFactory.decodeStream(input, null, boundsOptions)
+        } ?: return null
+
+        val sourceWidth = boundsOptions.outWidth
+        val sourceHeight = boundsOptions.outHeight
+        if (sourceWidth <= 0 || sourceHeight <= 0) return null
+
+        val longest = maxOf(sourceWidth, sourceHeight)
+        val sample = (longest / maxLongSide).coerceAtLeast(1)
+        val decodeOptions = BitmapFactory.Options().apply {
+            inSampleSize = Integer.highestOneBit(sample)
+            inPreferredConfig = Bitmap.Config.ARGB_8888
+        }
+
+        val decoded = context.contentResolver.openInputStream(uri)?.use { input ->
+            BitmapFactory.decodeStream(input, null, decodeOptions)
+        } ?: return null
+
+        val decodedLongest = maxOf(decoded.width, decoded.height)
+        if (decodedLongest <= maxLongSide) return decoded
+
+        val ratio = maxLongSide.toFloat() / decodedLongest.toFloat()
+        val scaledWidth = (decoded.width * ratio).toInt().coerceAtLeast(1)
+        val scaledHeight = (decoded.height * ratio).toInt().coerceAtLeast(1)
+        val scaled = Bitmap.createScaledBitmap(decoded, scaledWidth, scaledHeight, true)
+        if (scaled != decoded) {
+            decoded.recycle()
+        }
+        return scaled
+    }
+
+    private fun copyOriginalToCache(uri: Uri): File {
+        val destination = File.createTempFile("screenshot-", ".image", context.cacheDir)
+        val input = context.contentResolver.openInputStream(uri)
+            ?: throw IllegalArgumentException("Could not read screenshot")
+        val output = destination.outputStream()
+        try {
+            input.copyTo(output)
+        } finally {
+            output.close()
+            input.close()
+        }
+        return destination
+    }
+
+    companion object {
+        private const val MAX_IMAGE_LONG_SIDE = 256
+    }
+}
+
+data class Classification(
+    val category: String,
+    val confidence: Float,
+    val description: String = ""
+) {
+    companion object {
+        private val categoryPattern = Regex("""[\"]category[\"]\s*:\s*[\"]([^\"]+)[\"]""")
+        private val confidencePattern = Regex("""[\"]confidence[\"]\s*:\s*([0-9.]+)""")
+        private val descriptionPattern = Regex("""[\"]description[\"]\s*:\s*[\"]([^\"]*)[\"]""")
+
+        fun fromModelResponse(response: String, allowedCategories: List<String>): Classification {
+            val requestedCategory = categoryPattern.find(response)?.groupValues?.get(1)
+            val normalizedRequested = normalizeCategoryKey(requestedCategory)
+            val peopleCategory = allowedCategories.firstOrNull {
+                normalizeCategoryKey(it) == "only people no text"
+            }
+            val category = allowedCategories.firstOrNull {
+                normalizeCategoryKey(it) == normalizedRequested
+            } ?: when {
+                peopleCategory != null && normalizedRequested in setOf(
+                    "people",
+                    "person",
+                    "only people",
+                    "people no text",
+                    "person no text"
+                ) -> peopleCategory
+                else -> allowedCategories.last()
+            }
+            val confidence = confidencePattern.find(response)?.groupValues?.get(1)?.toFloatOrNull() ?: 0f
+            val description = descriptionPattern.find(response)?.groupValues?.get(1)?.trim().orEmpty()
+            return Classification(category, confidence.coerceIn(0f, 1f), description)
+        }
+
+        private fun normalizeCategoryKey(value: String?): String = value
+            .orEmpty()
+            .trim()
+            .trim('"', '\'', '.', ',', ';', ':', '!', '?', '(', ')', '[', ']', '{', '}')
+            .replace("&", " and ")
+            .replace(Regex("""\s+"""), " ")
+            .lowercase()
+    }
+}

@@ -1,0 +1,1662 @@
+package com.amoldalwai.screenshotcategory
+
+import android.Manifest
+import android.content.pm.PackageManager
+import android.provider.MediaStore
+import android.net.Uri
+import android.os.Bundle
+import android.text.format.DateFormat
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.border
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.material.icons.automirrored.outlined.ArrowBack
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Add
+import androidx.compose.material.icons.outlined.Check
+import androidx.compose.material.icons.outlined.Close
+import androidx.compose.material.icons.outlined.PhotoLibrary
+import androidx.compose.material.icons.outlined.Refresh
+import androidx.compose.material.icons.outlined.Search
+import androidx.compose.material.icons.outlined.Settings
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.lightColorScheme
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.lifecycleScope
+import coil.compose.AsyncImage
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.File
+
+class MainActivity : ComponentActivity() {
+    private var classifier: GemmaClassifier? = null
+    private val preferences by lazy { getSharedPreferences("screenshot_sorter", MODE_PRIVATE) }
+    private val classificationStoreFile by lazy { File(filesDir, CLASSIFICATION_STORE_FILE_NAME) }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
+        setContent { ScreenshotSorterApp() }
+    }
+
+    override fun onDestroy() {
+        classifier?.close()
+        classifier = null
+        super.onDestroy()
+    }
+
+    private fun loadCategories(): List<String> {
+        val savedCategories = normalizeCategories(
+            preferences.getString(CATEGORY_PREFERENCES_KEY, null)?.split("\n").orEmpty()
+        )
+        if (preferences.getInt(CATEGORY_DEFAULTS_VERSION_KEY, 0) >= CATEGORY_DEFAULTS_VERSION) {
+            return savedCategories
+        }
+
+        val updatedCategories = normalizeCategories(savedCategories + IDENTITY_CARDS_CATEGORY)
+        preferences.edit()
+            .putString(CATEGORY_PREFERENCES_KEY, updatedCategories.joinToString("\n"))
+            .putInt(CATEGORY_DEFAULTS_VERSION_KEY, CATEGORY_DEFAULTS_VERSION)
+            .apply()
+        return updatedCategories
+    }
+
+    private fun saveCategories(categories: List<String>): List<String> {
+        val normalized = normalizeCategories(categories)
+        preferences.edit()
+            .putString(CATEGORY_PREFERENCES_KEY, normalized.joinToString("\n"))
+            .apply()
+        return normalized
+    }
+
+    private fun loadCustomPrompt(): String = preferences.getString(CUSTOM_PROMPT_PREFERENCES_KEY, "").orEmpty()
+
+    private fun saveCustomPrompt(prompt: String): String {
+        val normalized = prompt.trim()
+        preferences.edit().putString(CUSTOM_PROMPT_PREFERENCES_KEY, normalized).apply()
+        return normalized
+    }
+
+    private fun resetCategories(): List<String> {
+        preferences.edit().remove(CATEGORY_PREFERENCES_KEY).apply()
+        return DEFAULT_CATEGORIES
+    }
+
+    private fun loadClassificationsFromDisk(): Map<UriKey, ClassifiedImage> {
+        if (!classificationStoreFile.exists()) return emptyMap()
+        return runCatching {
+            val array = JSONArray(classificationStoreFile.readText())
+            buildMap {
+                for (index in 0 until array.length()) {
+                    val item = array.optJSONObject(index) ?: continue
+                    val imageUri = item.optString("imageUri").trim()
+                    if (imageUri.isBlank()) continue
+                    val confidence = item.optDouble("confidence", 0.0).toFloat().coerceIn(0f, 1f)
+                    put(
+                        UriKey(imageUri),
+                        ClassifiedImage(
+                            imageId = item.optString("imageId").ifBlank { imageUri },
+                            imageUri = imageUri,
+                            category = item.optString("category").ifBlank { "Others" },
+                            confidence = confidence,
+                            description = item.optString("description").orEmpty(),
+                            updatedAt = item.optLong("updatedAt", 0L)
+                        )
+                    )
+                }
+            }
+        }.getOrElse { emptyMap() }
+    }
+
+    private fun saveClassificationsToDisk(classifications: Collection<ClassifiedImage>): Boolean {
+        val array = JSONArray()
+        classifications.forEach { classification ->
+            array.put(
+                JSONObject().apply {
+                    put("imageId", classification.imageId)
+                    put("imageUri", classification.imageUri)
+                    put("category", classification.category)
+                    put("confidence", classification.confidence)
+                    put("description", classification.description)
+                    put("updatedAt", classification.updatedAt)
+                }
+            )
+        }
+        return runCatching {
+            classificationStoreFile.writeText(array.toString())
+        }.isSuccess
+    }
+
+    private fun uriStillExists(uriValue: String): Boolean = runCatching {
+        val uri = Uri.parse(uriValue)
+        contentResolver.query(
+            uri,
+            arrayOf(MediaStore.MediaColumns._ID),
+            null,
+            null,
+            null
+        )?.use { cursor ->
+            cursor.moveToFirst()
+        } ?: false
+    }.getOrElse { false }
+
+    private fun pruneMissingClassifications(
+        current: Map<UriKey, ClassifiedImage>
+    ): Map<UriKey, ClassifiedImage> {
+        val kept = current.filterValues { uriStillExists(it.imageUri) }
+        if (kept.size != current.size) {
+            saveClassificationsToDisk(kept.values)
+        }
+        return kept
+    }
+
+    private fun mergeScreenshotsWithPersisted(
+        scanned: List<Screenshot>,
+        persisted: Map<UriKey, ClassifiedImage>
+    ): List<Screenshot> {
+        val existing = scanned.map { UriKey(it.uri.toString()) }.toSet()
+        val restored = persisted.values
+            .filter { uriStillExists(it.imageUri) }
+            .filterNot { UriKey(it.imageUri) in existing }
+            .map { saved ->
+                Screenshot(
+                    imageId = saved.imageId,
+                    uri = Uri.parse(saved.imageUri),
+                    displayName = "Restored image",
+                    relativePath = "Saved"
+                )
+            }
+        return scanned + restored
+    }
+
+    @Composable
+    private fun ScreenshotSorterApp() {
+        val modelDownload = remember { ModelDownload(this) }
+        var screenshots by remember { mutableStateOf(emptyList<Screenshot>()) }
+        var savedCategories by remember { mutableStateOf(loadCategories()) }
+        var savedCustomPrompt by remember { mutableStateOf(loadCustomPrompt()) }
+        var draftCustomPrompt by remember { mutableStateOf(savedCustomPrompt) }
+        var showSettings by remember { mutableStateOf(false) }
+        var showDiscardChanges by remember { mutableStateOf(false) }
+        var activeClassification by remember { mutableStateOf<UriKey?>(null) }
+        var isModelPreparing by remember { mutableStateOf(false) }
+        var isBatchClassifying by remember { mutableStateOf(false) }
+        var batchDone by remember { mutableStateOf(0) }
+        var batchTotal by remember { mutableStateOf(0) }
+        var batchStartEpochMs by remember { mutableStateOf<Long?>(null) }
+        var batchStageMessage by remember { mutableStateOf<String?>(null) }
+        var searchQuery by remember { mutableStateOf("") }
+        var isSearchResultsLoading by remember { mutableStateOf(false) }
+        var selectedCategory by remember { mutableStateOf<String?>(null) }
+        var showAllGallery by remember { mutableStateOf(false) }
+        var selectedGalleryImage by remember { mutableStateOf<Screenshot?>(null) }
+        var isCategorySectionLoading by remember { mutableStateOf(true) }
+        var isScreenshotSectionLoading by remember { mutableStateOf(true) }
+        var selectedImageProfile by remember { mutableStateOf<Pair<Screenshot, ClassifiedImage>?>(null) }
+        var status by remember {
+            mutableStateOf(
+                if (modelDownload.isReady()) {
+                    "Model ready. Scan screenshots to begin."
+                } else {
+                    "Download Gemma 4 E2B before classifying screenshots."
+                }
+            )
+        }
+        var classifications by remember { mutableStateOf(loadClassificationsFromDisk()) }
+        val permissionLauncher = rememberLauncherForActivityResult(
+            ActivityResultContracts.RequestPermission()
+        ) { granted ->
+            if (!granted) {
+                isCategorySectionLoading = false
+                isScreenshotSectionLoading = false
+                status = "Image permission is required to scan screenshots."
+                return@rememberLauncherForActivityResult
+            }
+            isCategorySectionLoading = true
+            isScreenshotSectionLoading = true
+            lifecycleScope.launch {
+                val cleaned = withContext(Dispatchers.IO) { pruneMissingClassifications(classifications) }
+                classifications = cleaned
+                loadScreenshots { loadedScreenshots ->
+                    screenshots = mergeScreenshotsWithPersisted(loadedScreenshots, cleaned)
+                    status = "Found ${loadedScreenshots.size} recent screenshots."
+                    isCategorySectionLoading = false
+                    isScreenshotSectionLoading = false
+                }
+            }
+        }
+        val galleryPicker = rememberLauncherForActivityResult(
+            ActivityResultContracts.PickVisualMedia()
+        ) { selectedUri ->
+            if (selectedUri != null) {
+                val selectedImage = Screenshot(
+                    imageId = selectedUri.lastPathSegment ?: selectedUri.toString(),
+                    uri = selectedUri,
+                    displayName = "Selected gallery image",
+                    relativePath = "Gallery"
+                )
+                selectedGalleryImage = selectedImage
+                screenshots = listOf(selectedImage) + screenshots.filterNot { it.uri == selectedUri }
+                status = "Gallery image added."
+            }
+        }
+
+        LaunchedEffect(modelDownload.isReady()) {
+            if (!modelDownload.isReady() || classifier != null || isModelPreparing) return@LaunchedEffect
+            isModelPreparing = true
+            status = "Preparing Gemma engine in background. First classification will be smoother."
+            val warmup = runCatching {
+                withContext(Dispatchers.IO) {
+                    val activeClassifier = classifier ?: GemmaClassifier(
+                        this@MainActivity,
+                        modelDownload.modelFile
+                    ).also { classifier = it }
+                    activeClassifier.warmUp()
+                }
+            }
+            isModelPreparing = false
+            warmup.onSuccess {
+                status = "Model ready. Scan screenshots to begin."
+            }.onFailure { error ->
+                status = "Model preparation failed: ${error.message ?: "unknown error"}"
+            }
+        }
+
+        LaunchedEffect(Unit) {
+            if (ContextCompat.checkSelfPermission(
+                    this@MainActivity,
+                    Manifest.permission.READ_MEDIA_IMAGES
+                ) == PackageManager.PERMISSION_GRANTED
+            ) {
+                isCategorySectionLoading = true
+                isScreenshotSectionLoading = true
+                lifecycleScope.launch {
+                    val cleaned = withContext(Dispatchers.IO) { pruneMissingClassifications(classifications) }
+                    classifications = cleaned
+                    loadScreenshots { loadedScreenshots ->
+                        val merged = mergeScreenshotsWithPersisted(loadedScreenshots, cleaned)
+                        screenshots = merged
+                        status = "Loaded ${merged.size} images. Restored ${cleaned.size} saved classifications."
+                        isCategorySectionLoading = false
+                        isScreenshotSectionLoading = false
+                    }
+                }
+            } else {
+                isCategorySectionLoading = false
+                isScreenshotSectionLoading = false
+            }
+        }
+
+        LaunchedEffect(searchQuery) {
+            val activeSearch = searchQuery.trim().isNotEmpty()
+            if (!activeSearch) {
+                isSearchResultsLoading = false
+                return@LaunchedEffect
+            }
+            isSearchResultsLoading = true
+            delay(120)
+            isSearchResultsLoading = false
+        }
+
+        MaterialTheme(colorScheme = screenshotSorterColors) {
+            Scaffold(containerColor = MaterialTheme.colorScheme.surface) { padding ->
+                val backendCpuPercent = 50
+                val backendGpuPercent = 50
+
+                suspend fun classifyAndPersist(screenshot: Screenshot): Boolean {
+                    val imageKey = UriKey(screenshot.uri.toString())
+                    activeClassification = imageKey
+                    val result = runCatching {
+                        withContext(Dispatchers.IO) {
+                            val activeClassifier = classifier ?: GemmaClassifier(
+                                this@MainActivity,
+                                modelDownload.modelFile
+                            ).also { classifier = it }
+                            activeClassifier.classify(
+                                screenshot.uri,
+                                savedCategories,
+                                savedCustomPrompt
+                            )
+                        }
+                    }
+                    activeClassification = null
+                    return result.map { classification ->
+                        val savedEntry = ClassifiedImage(
+                            imageId = screenshot.imageId,
+                            imageUri = screenshot.uri.toString(),
+                            category = classification.category,
+                            confidence = classification.confidence,
+                            description = classification.description,
+                            updatedAt = System.currentTimeMillis()
+                        )
+                        val updated = classifications + (imageKey to savedEntry)
+                        classifications = updated
+                        withContext(Dispatchers.IO) {
+                            saveClassificationsToDisk(updated.values)
+                        }
+                    }.getOrElse { false }
+                }
+
+                val isSearchView = searchQuery.trim().isNotEmpty()
+                val filteredScreenshots = screenshots.filter { screenshot ->
+                    val classification = classifications[UriKey(screenshot.uri.toString())]
+                    val categoryMatches = selectedCategory == null || classification?.category == selectedCategory
+                    val requiresClassifiedImage = showAllGallery || isSearchView
+                    val allGalleryMatches = !requiresClassifiedImage || classification != null
+                    val combined = listOf(
+                        screenshot.displayName,
+                        screenshot.relativePath.orEmpty(),
+                        classification?.category.orEmpty(),
+                        classification?.description.orEmpty()
+                    ).joinToString(" ").lowercase()
+                    categoryMatches && allGalleryMatches && (searchQuery.isBlank() || combined.contains(searchQuery.trim().lowercase()))
+                }
+
+                val collectionItems = filteredScreenshots.mapNotNull { screenshot ->
+                    val classification = classifications[UriKey(screenshot.uri.toString())] ?: return@mapNotNull null
+                    screenshot to classification
+                }
+                val groupedCollections = collectionItems.groupBy { (_, classification) -> classification.category }
+                val totalScreenshotsCount = screenshots.size
+                val classifiedScreenshotsCount = screenshots.count {
+                    UriKey(it.uri.toString()) in classifications
+                }
+
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(
+                            Brush.verticalGradient(
+                                colors = listOf(Color(0xFFF2F8F8), Color(0xFFF8FAFC))
+                            )
+                        )
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(padding)
+                            .padding(20.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        val hasBackTarget = selectedCategory != null || showAllGallery
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            if (hasBackTarget) {
+                                IconButton(onClick = {
+                                    selectedCategory = null
+                                    showAllGallery = false
+                                    selectedImageProfile = null
+                                    status = "Back to home view."
+                                }) {
+                                    Icon(
+                                        Icons.AutoMirrored.Outlined.ArrowBack,
+                                        contentDescription = "Back",
+                                        tint = Color(0xFF2F6E6A)
+                                    )
+                                }
+                            }
+                            Text(
+                                "Screenshot Sorter",
+                                style = MaterialTheme.typography.headlineSmall,
+                                color = Color(0xFF102A43),
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
+                        IconButton(onClick = {
+                            draftCustomPrompt = savedCustomPrompt
+                            showSettings = true
+                        }) {
+                            Icon(
+                                Icons.Outlined.Settings,
+                                contentDescription = "Prompt settings",
+                                tint = Color(0xFF2F6E6A)
+                            )
+                        }
+                    }
+
+                    if (showSettings) {
+                        PromptSettings(
+                            customPrompt = draftCustomPrompt,
+                            promptPreview = buildPromptPreview(savedCategories, draftCustomPrompt),
+                            onBack = {
+                                if (draftCustomPrompt != savedCustomPrompt) {
+                                    showDiscardChanges = true
+                                } else {
+                                    showSettings = false
+                                }
+                            },
+                            onCustomPromptChange = { draftCustomPrompt = it },
+                            onSave = {
+                                savedCustomPrompt = saveCustomPrompt(draftCustomPrompt)
+                                draftCustomPrompt = savedCustomPrompt
+                                showSettings = false
+                                status = "Prompt saved."
+                            },
+                            onReset = {
+                                draftCustomPrompt = ""
+                            }
+                        )
+                        if (showDiscardChanges) {
+                            AlertDialog(
+                                onDismissRequest = { showDiscardChanges = false },
+                                title = { Text("Discard changes?") },
+                                text = { Text("Your prompt edits have not been saved.") },
+                                confirmButton = {
+                                    TextButton(onClick = {
+                                        draftCustomPrompt = savedCustomPrompt
+                                        showDiscardChanges = false
+                                        showSettings = false
+                                    }) { Text("Yes") }
+                                },
+                                dismissButton = {
+                                    TextButton(onClick = { showDiscardChanges = false }) { Text("No") }
+                                }
+                            )
+                        }
+                    } else {
+                        LazyColumn(
+                            verticalArrangement = Arrangement.spacedBy(12.dp),
+                            contentPadding = PaddingValues(bottom = 16.dp)
+                        ) {
+                            item {
+                                Text(
+                                    "AI SCREENSHOT ORGANIZER",
+                                    color = Color(0xFF2F6E6A),
+                                    style = MaterialTheme.typography.labelLarge,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                            item {
+                                SearchField(
+                                    value = searchQuery,
+                                    onValueChange = { searchQuery = it },
+                                    onClear = { searchQuery = "" }
+                                )
+                            }
+                            item { StatusCard(status) }
+                            item {
+                                HomeMetricsCard(
+                                    classifiedCount = classifiedScreenshotsCount,
+                                    totalCount = totalScreenshotsCount
+                                )
+                            }
+                            if (isBatchClassifying && batchTotal > 0) {
+                                item {
+                                    val pending = (batchTotal - batchDone).coerceAtLeast(0)
+                                    val elapsedSeconds = batchStartEpochMs?.let {
+                                        ((System.currentTimeMillis() - it) / 1000L).coerceAtLeast(0L)
+                                    } ?: 0L
+                                    val avgPerImageSeconds = if (batchDone > 0) {
+                                        elapsedSeconds.toDouble() / batchDone.toDouble()
+                                    } else {
+                                        0.0
+                                    }
+                                    Card(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        colors = CardDefaults.cardColors(containerColor = Color(0xFFEFF6FF)),
+                                        shape = androidx.compose.foundation.shape.RoundedCornerShape(14.dp)
+                                    ) {
+                                        Column(
+                                            modifier = Modifier.padding(12.dp),
+                                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                                        ) {
+                                            Text(
+                                                text = "Classify 10 progress: done $batchDone | pending $pending",
+                                                style = MaterialTheme.typography.bodyMedium,
+                                                color = Color(0xFF1E3A5F),
+                                                fontWeight = FontWeight.SemiBold
+                                            )
+                                            batchStageMessage?.let { stage ->
+                                                Text(
+                                                    text = stage,
+                                                    style = MaterialTheme.typography.bodySmall,
+                                                    color = Color(0xFF2F6E6A),
+                                                    fontWeight = FontWeight.Medium
+                                                )
+                                            }
+                                            Text(
+                                                text = "Backend usage (estimated): CPU $backendCpuPercent% | GPU $backendGpuPercent%",
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = Color(0xFF355C7D)
+                                            )
+                                            Text(
+                                                text = "Elapsed: ${elapsedSeconds}s | Avg/image: ${"%.1f".format(avgPerImageSeconds)}s",
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = Color(0xFF355C7D)
+                                            )
+                                            LinearProgressIndicator(
+                                                progress = { (batchDone.toFloat() / batchTotal.toFloat()).coerceIn(0f, 1f) },
+                                                modifier = Modifier.fillMaxWidth(),
+                                                color = Color(0xFF2F6E6A),
+                                                trackColor = Color(0xFFD6E4F3)
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                            item {
+                                Row(
+                                    horizontalArrangement = Arrangement.spacedBy(16.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    val hasMediaPermission = ContextCompat.checkSelfPermission(
+                                        this@MainActivity,
+                                        Manifest.permission.READ_MEDIA_IMAGES
+                                    ) == PackageManager.PERMISSION_GRANTED
+
+                                    if (!modelDownload.isReady()) {
+                                        QuickAction(
+                                            icon = Icons.Outlined.Add,
+                                            label = "Model",
+                                            onClick = {
+                                                modelDownload.enqueue()
+                                                status = "Download started. Keep the app installed while it completes."
+                                            }
+                                        )
+                                    }
+                                    if (!hasMediaPermission) {
+                                        QuickAction(
+                                            icon = Icons.Outlined.PhotoLibrary,
+                                            label = "Access",
+                                            onClick = {
+                                                permissionLauncher.launch(Manifest.permission.READ_MEDIA_IMAGES)
+                                            }
+                                        )
+                                    }
+                                    QuickAction(
+                                        icon = Icons.Outlined.Check,
+                                        label = "Classify 10",
+                                        onClick = {
+                                            if (!modelDownload.isReady()) {
+                                                status = "Download the model first."
+                                                return@QuickAction
+                                            }
+                                            if (isBatchClassifying) {
+                                                status = "Batch classification is already running."
+                                                return@QuickAction
+                                            }
+                                            val pending = screenshots.filter { shot ->
+                                                UriKey(shot.uri.toString()) !in classifications
+                                            }.take(10)
+                                            if (pending.isEmpty()) {
+                                                status = "No uncategorized screenshots available in top 10."
+                                                return@QuickAction
+                                            }
+
+                                            lifecycleScope.launch {
+                                                val needsInitialization = classifier == null
+                                                isBatchClassifying = true
+                                                batchDone = 0
+                                                batchTotal = pending.size
+                                                batchStartEpochMs = System.currentTimeMillis()
+                                                batchStageMessage = if (needsInitialization) {
+                                                    "Initializing Gemma for first image..."
+                                                } else {
+                                                    "Classification started."
+                                                }
+                                                status = if (needsInitialization) {
+                                                    "Initializing Gemma. First image may take longer."
+                                                } else {
+                                                    "Starting classification for top ${pending.size} uncategorized screenshots..."
+                                                }
+
+                                                var failed = 0
+                                                pending.forEachIndexed { index, shot ->
+                                                    if (!(needsInitialization && index == 0)) {
+                                                        batchStageMessage = "Classification started: image ${index + 1}/$batchTotal"
+                                                    }
+                                                    status = "Classifying ${index + 1}/$batchTotal: ${shot.displayName}"
+                                                    val ok = classifyAndPersist(shot)
+                                                    if (!ok) failed += 1
+                                                    if (needsInitialization && index == 0) {
+                                                        batchStageMessage = "Gemma initialized. Classification started."
+                                                    }
+                                                    batchDone = index + 1
+                                                    if (batchDone < batchTotal) {
+                                                        batchStageMessage = "Classification started: image ${batchDone + 1}/$batchTotal"
+                                                    }
+                                                    delay(75)
+                                                }
+
+                                                isBatchClassifying = false
+                                                batchStartEpochMs = null
+                                                batchStageMessage = null
+                                                status = if (failed == 0) {
+                                                    "Classify 10 complete: $batchDone / $batchTotal succeeded."
+                                                } else {
+                                                    "Classify 10 complete: ${batchTotal - failed} succeeded, $failed failed."
+                                                }
+                                            }
+                                        }
+                                    )
+                                    QuickAction(
+                                        icon = Icons.Outlined.PhotoLibrary,
+                                        label = "Gallery",
+                                        onClick = {
+                                            galleryPicker.launch(
+                                                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                                            )
+                                        }
+                                    )
+                                }
+                            }
+                            if (!isSearchView && isCategorySectionLoading) {
+                                item { CategoryCollectionSkeleton() }
+                            } else if (!isSearchView && groupedCollections.isNotEmpty()) {
+                                item {
+                                    CategoryCollectionGrid(
+                                        groupedCollections = groupedCollections,
+                                        selectedCategory = selectedCategory,
+                                        onCategoryClick = { category ->
+                                            selectedCategory = category
+                                            showAllGallery = false
+                                            selectedImageProfile = null
+                                            status = "Viewing $category photos."
+                                        },
+                                        onViewAllClick = {
+                                            selectedCategory = null
+                                            showAllGallery = true
+                                            selectedImageProfile = null
+                                            status = "Showing gallery across all categories."
+                                        }
+                                    )
+                                }
+                            }
+                            if (isSearchView || selectedCategory != null || showAllGallery) {
+                                item {
+                                    Text(
+                                        text = if (isSearchView) {
+                                            "Search results for: ${searchQuery.trim()}"
+                                        } else if (selectedCategory != null) {
+                                            "Showing category: ${selectedCategory}"
+                                        } else {
+                                            "Showing all categorized screenshots"
+                                        },
+                                        style = MaterialTheme.typography.labelLarge,
+                                        color = Color(0xFF2F6E6A),
+                                        fontWeight = FontWeight.Medium
+                                    )
+                                }
+                                item {
+                                    Text(
+                                        if (isSearchView) "Search image results" else "Category gallery",
+                                        style = MaterialTheme.typography.titleMedium,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = Color(0xFF102A43)
+                                    )
+                                }
+                                if (isScreenshotSectionLoading || isSearchResultsLoading) {
+                                    item { CategoryGallerySkeleton() }
+                                } else {
+                                    item {
+                                        CategoryImageGrid(
+                                            screenshots = filteredScreenshots,
+                                            classifications = classifications,
+                                            onImageClick = { screenshot ->
+                                                val details = classifications[UriKey(screenshot.uri.toString())]
+                                                if (details != null) {
+                                                    selectedImageProfile = screenshot to details
+                                                }
+                                            }
+                                        )
+                                    }
+                                }
+                            } else {
+                                selectedGalleryImage?.let { galleryImage ->
+                                    item {
+                                        Text(
+                                            text = "Selected gallery image",
+                                            style = MaterialTheme.typography.titleMedium,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = Color(0xFF102A43)
+                                        )
+                                    }
+                                    item {
+                                        ScreenshotRow(
+                                            screenshot = galleryImage,
+                                            classification = classifications[UriKey(galleryImage.uri.toString())]?.toClassification(),
+                                            enabled = modelDownload.isReady() && activeClassification == null && !isModelPreparing && !isBatchClassifying,
+                                            isClassifying = activeClassification == UriKey(galleryImage.uri.toString()),
+                                            onClassify = {
+                                                lifecycleScope.launch {
+                                                    status = if (classifier == null) {
+                                                        "Preparing Gemma for the first image. This can take a minute."
+                                                    } else {
+                                                        "Classifying ${galleryImage.displayName}..."
+                                                    }
+                                                    val savedToDisk = classifyAndPersist(galleryImage)
+                                                    status = if (savedToDisk) {
+                                                        "Classification finished."
+                                                    } else {
+                                                        "Classification failed or could not be saved."
+                                                    }
+                                                }
+                                            }
+                                        )
+                                    }
+                                    item {
+                                        TextButton(onClick = { selectedGalleryImage = null }) {
+                                            Text("Clear selected gallery image")
+                                        }
+                                    }
+                                }
+                                item {
+                                    Card(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        shape = androidx.compose.foundation.shape.RoundedCornerShape(14.dp),
+                                        colors = CardDefaults.cardColors(containerColor = Color(0xFFEAF3F3))
+                                    ) {
+                                        Column(
+                                            modifier = Modifier.padding(14.dp),
+                                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                                        ) {
+                                            Text(
+                                                text = "Home is focused on categories",
+                                                style = MaterialTheme.typography.titleSmall,
+                                                color = Color(0xFF102A43),
+                                                fontWeight = FontWeight.SemiBold
+                                            )
+                                            Text(
+                                                text = "Select a category or tap View All to browse screenshots.",
+                                                style = MaterialTheme.typography.bodyMedium,
+                                                color = Color(0xFF355C7D)
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    }
+
+                    selectedImageProfile?.let { (screenshot, details) ->
+                        ImageProfileDialog(
+                            screenshot = screenshot,
+                            details = details,
+                            onDismiss = { selectedImageProfile = null }
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    private fun loadScreenshots(onLoaded: (List<Screenshot>) -> Unit) {
+        lifecycleScope.launch {
+            onLoaded(withContext(Dispatchers.IO) { ScreenshotMedia(this@MainActivity).loadRecentScreenshots() })
+        }
+    }
+}
+
+private const val CATEGORY_PREFERENCES_KEY = "categories"
+private const val CATEGORY_DEFAULTS_VERSION_KEY = "category_defaults_version"
+private const val CUSTOM_PROMPT_PREFERENCES_KEY = "custom_prompt"
+private const val CLASSIFICATION_STORE_FILE_NAME = "classification_index.json"
+private const val CATEGORY_DEFAULTS_VERSION = 1
+private const val IDENTITY_CARDS_CATEGORY = "Identity cards"
+
+private data class ClassifiedImage(
+    val imageId: String,
+    val imageUri: String,
+    val category: String,
+    val confidence: Float,
+    val description: String,
+    val updatedAt: Long
+) {
+    fun toClassification(): Classification = Classification(
+        category = category,
+        confidence = confidence,
+        description = description
+    )
+}
+
+private val DEFAULT_CATEGORIES = listOf(
+    "LinkedIn",
+    "Quotes/Learning",
+    "Food",
+    "Payment/Finance/Bills",
+    IDENTITY_CARDS_CATEGORY,
+    "QR",
+    "Comment Section (YouTube / Instagram)",
+    "Nature/Plants",
+    "Only people no text",
+    "Games (BGMI etc)",
+    "Maps",
+    "Greeting Messages (Good morning etc)",
+    "Animals",
+    "Others"
+)
+
+private fun normalizeCategories(categories: List<String>): List<String> =
+    categories
+        .map(String::trim)
+        .filter(String::isNotBlank)
+        .distinctBy(String::lowercase)
+        .ifEmpty { DEFAULT_CATEGORIES }
+
+@Composable
+private fun PromptSettings(
+    customPrompt: String,
+    promptPreview: String,
+    onBack: () -> Unit,
+    onCustomPromptChange: (String) -> Unit,
+    onSave: () -> Unit,
+    onReset: () -> Unit
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        IconButton(onClick = onBack) {
+            Icon(Icons.AutoMirrored.Outlined.ArrowBack, contentDescription = "Back")
+        }
+        Text("Prompt settings", style = MaterialTheme.typography.titleLarge)
+        IconButton(onClick = onReset) {
+            Icon(Icons.Outlined.Refresh, contentDescription = "Reset prompt")
+        }
+    }
+    Text("Edit the extra prompt that Gemma applies during classification.")
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = androidx.compose.foundation.shape.RoundedCornerShape(8.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            Text("Custom prompt", style = MaterialTheme.typography.titleMedium)
+            Text("This is used as-is during classification. Keep it short and specific.")
+            OutlinedTextField(
+                value = customPrompt,
+                onValueChange = onCustomPromptChange,
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("Instructions for Gemma") },
+                placeholder = { Text("For example: prioritize food over quotes") },
+                minLines = 3
+            )
+        }
+    }
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = androidx.compose.foundation.shape.RoundedCornerShape(8.dp),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFFF4F7FB))
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            Text("Prompt currently used by app", style = MaterialTheme.typography.titleMedium)
+            Text("This is the exact full prompt template used during classification.")
+            OutlinedTextField(
+                value = promptPreview,
+                onValueChange = {},
+                readOnly = true,
+                modifier = Modifier.fillMaxWidth(),
+                minLines = 8,
+                maxLines = 14
+            )
+        }
+    }
+    Button(onClick = onSave) {
+        Text("Save prompt")
+    }
+}
+
+private val screenshotSorterColors = lightColorScheme(
+    primary = Color(0xFF2F6E6A),
+    onPrimary = Color.White,
+    secondary = Color(0xFFFFB454),
+    surface = Color(0xFFF8FAFC),
+    surfaceVariant = Color(0xFFE9F2F2),
+    onSurfaceVariant = Color(0xFF1E4F4B)
+)
+
+@Composable
+private fun StatusCard(status: String) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFFE9F2F2)),
+        shape = androidx.compose.foundation.shape.RoundedCornerShape(14.dp)
+    ) {
+        Text(
+            text = status,
+            modifier = Modifier.padding(14.dp),
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            style = MaterialTheme.typography.bodyMedium,
+            fontWeight = FontWeight.Medium
+        )
+    }
+}
+
+@Composable
+private fun HomeMetricsCard(classifiedCount: Int, totalCount: Int) {
+    val completionPercent = if (totalCount > 0) {
+        (classifiedCount.toFloat() / totalCount.toFloat()).coerceIn(0f, 1f)
+    } else {
+        0f
+    }
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFFF3F8FF)),
+        shape = androidx.compose.foundation.shape.RoundedCornerShape(14.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Text(
+                text = "Classified screenshots",
+                style = MaterialTheme.typography.titleSmall,
+                color = Color(0xFF1E3A5F),
+                fontWeight = FontWeight.SemiBold
+            )
+            Text(
+                text = "$classifiedCount / $totalCount",
+                style = MaterialTheme.typography.headlineSmall,
+                color = Color(0xFF102A43),
+                fontWeight = FontWeight.Bold
+            )
+            LinearProgressIndicator(
+                progress = { completionPercent },
+                modifier = Modifier.fillMaxWidth(),
+                color = Color(0xFF2F6E6A),
+                trackColor = Color(0xFFD6E4F3)
+            )
+            Text(
+                text = "Only currently available screenshots are counted.",
+                style = MaterialTheme.typography.bodySmall,
+                color = Color(0xFF355C7D)
+            )
+        }
+    }
+}
+
+@JvmInline
+value class UriKey(val value: String)
+
+@Composable
+private fun ScreenshotRow(
+    screenshot: Screenshot,
+    classification: Classification?,
+    enabled: Boolean,
+    isClassifying: Boolean,
+    onClassify: () -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = androidx.compose.foundation.shape.RoundedCornerShape(14.dp),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFFFCFEFE))
+    ) {
+        Row(modifier = Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+            AsyncImage(
+                model = screenshot.uri,
+                contentDescription = screenshot.displayName,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.size(92.dp)
+            )
+            Spacer(modifier = Modifier.size(12.dp))
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text(
+                    screenshot.displayName,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    color = Color(0xFF102A43)
+                )
+                Text(
+                    screenshot.relativePath ?: "Unknown location",
+                    style = MaterialTheme.typography.bodySmall,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    color = Color(0xFF5E6C84)
+                )
+                if (classification != null) {
+                    Surface(
+                        color = categoryColor(classification.category),
+                        shape = androidx.compose.foundation.shape.RoundedCornerShape(16.dp)
+                    ) {
+                        Text(
+                            text = "${classification.category}  ${(classification.confidence * 100).toInt()}%",
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                            color = Color.White
+                        )
+                    }
+                    if (classification.description.isNotBlank()) {
+                        Text(
+                            classification.description,
+                            style = MaterialTheme.typography.bodySmall,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                            color = Color(0xFF5E6C84)
+                        )
+                    }
+                } else {
+                    Text("Not categorized", color = MaterialTheme.colorScheme.primary)
+                }
+                if (isClassifying) {
+                    LinearProgressIndicator(
+                        modifier = Modifier.fillMaxWidth(),
+                        color = Color(0xFF2E9B58),
+                        trackColor = Color(0xFFCEE9D7)
+                    )
+                }
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Surface(
+                        color = if (enabled && !isClassifying) Color(0xFFE2F0EF) else Color(0xFFF1F5F9),
+                        shape = androidx.compose.foundation.shape.RoundedCornerShape(14.dp)
+                    ) {
+                        IconButton(enabled = enabled && !isClassifying, onClick = onClassify) {
+                            if (isClassifying) {
+                                CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                            } else {
+                                Icon(Icons.Outlined.Check, contentDescription = "Classify image", tint = Color(0xFF2F6E6A))
+                            }
+                        }
+                    }
+                    Text(
+                        if (isClassifying) "Classifying..." else "Classify",
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.Medium,
+                        color = Color(0xFF2F6E6A)
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SearchField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    onClear: () -> Unit
+) {
+    OutlinedTextField(
+        value = value,
+        onValueChange = onValueChange,
+        modifier = Modifier.fillMaxWidth(),
+        singleLine = true,
+        shape = androidx.compose.foundation.shape.RoundedCornerShape(24.dp),
+        placeholder = {
+            Text("Search anything from screenshots...", color = Color(0xFF8A99A8))
+        },
+        leadingIcon = {
+            Icon(Icons.Outlined.Search, contentDescription = "Search", tint = Color(0xFF8A99A8))
+        },
+        trailingIcon = {
+            if (value.isNotBlank()) {
+                IconButton(onClick = onClear) {
+                    Icon(Icons.Outlined.Close, contentDescription = "Clear search", tint = Color(0xFF8A99A8))
+                }
+            }
+        }
+    )
+}
+
+@Composable
+private fun QuickAction(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    label: String,
+    onClick: () -> Unit
+) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Surface(
+            color = Color(0xFFE2F0EF),
+            shape = androidx.compose.foundation.shape.RoundedCornerShape(14.dp)
+        ) {
+            IconButton(onClick = onClick) {
+                Icon(icon, contentDescription = label, tint = Color(0xFF2F6E6A))
+            }
+        }
+        Text(
+            label,
+            style = MaterialTheme.typography.labelSmall,
+            color = Color(0xFF4A6572),
+            fontWeight = FontWeight.Medium
+        )
+    }
+}
+
+@Composable
+private fun CategoryCollectionGrid(
+    groupedCollections: Map<String, List<Pair<Screenshot, ClassifiedImage>>>,
+    selectedCategory: String?,
+    onCategoryClick: (String) -> Unit,
+    onViewAllClick: () -> Unit
+) {
+    val sortedCollections = groupedCollections.entries
+        .sortedWith(compareByDescending<Map.Entry<String, List<Pair<Screenshot, ClassifiedImage>>>> { it.value.size }
+            .thenBy { it.key })
+
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            "Primary categories",
+            style = MaterialTheme.typography.titleLarge,
+            fontWeight = FontWeight.SemiBold,
+            color = Color(0xFF102A43)
+        )
+        TextButton(onClick = onViewAllClick) {
+            Text("View All")
+        }
+    }
+
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        sortedCollections.chunked(2).forEach { rowItems ->
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                rowItems.forEach { entry ->
+                    Box(modifier = Modifier.weight(1f)) {
+                        CategoryCollectionCard(
+                            category = entry.key,
+                            count = entry.value.size,
+                            previewUri = entry.value.firstOrNull()?.first?.uri,
+                            isSelected = entry.key == selectedCategory,
+                            onClick = { onCategoryClick(entry.key) }
+                        )
+                    }
+                }
+                if (rowItems.size == 1) {
+                    Spacer(modifier = Modifier.weight(1f))
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CategoryCollectionCard(
+    category: String,
+    count: Int,
+    previewUri: Uri?,
+    isSelected: Boolean,
+    onClick: () -> Unit
+) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .aspectRatio(1.22f)
+            .clickable(onClick = onClick),
+        shape = androidx.compose.foundation.shape.RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = if (isSelected) Color(0xFFD6ECEA) else Color(0xFFEAF3F3)
+        )
+    ) {
+        Box(modifier = Modifier.fillMaxSize()) {
+            if (previewUri != null) {
+                AsyncImage(
+                    model = previewUri,
+                    contentDescription = category,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize()
+                )
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(
+                            Brush.verticalGradient(
+                                colors = listOf(Color.Transparent, Color(0xAA000000))
+                            )
+                        )
+                )
+            }
+
+            Surface(
+                color = Color(0xCCECEFF4),
+                shape = androidx.compose.foundation.shape.RoundedCornerShape(999.dp),
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .padding(10.dp)
+            ) {
+                Text(
+                    text = if (count == 1) "1 item" else "$count items",
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = Color(0xFF1F2937)
+                )
+            }
+
+            Text(
+                text = category,
+                style = MaterialTheme.typography.titleMedium,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+                color = if (previewUri == null) MaterialTheme.colorScheme.onSurface else Color.White,
+                modifier = Modifier
+                    .align(Alignment.BottomStart)
+                    .padding(10.dp)
+            )
+        }
+    }
+}
+
+@Composable
+private fun CategoryImageGrid(
+    screenshots: List<Screenshot>,
+    classifications: Map<UriKey, ClassifiedImage>,
+    onImageClick: (Screenshot) -> Unit
+) {
+    if (screenshots.isEmpty()) {
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = Color(0xFFEAF3F3)),
+            shape = androidx.compose.foundation.shape.RoundedCornerShape(14.dp)
+        ) {
+            Text(
+                text = "No images in this category yet.",
+                modifier = Modifier.padding(14.dp),
+                color = Color(0xFF2F6E6A)
+            )
+        }
+        return
+    }
+
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        screenshots.chunked(2).forEach { rowItems ->
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                rowItems.forEach { screenshot ->
+                    val details = classifications[UriKey(screenshot.uri.toString())]
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .aspectRatio(1f)
+                            .clip(androidx.compose.foundation.shape.RoundedCornerShape(16.dp))
+                            .clickable { onImageClick(screenshot) }
+                    ) {
+                        AsyncImage(
+                            model = screenshot.uri,
+                            contentDescription = screenshot.displayName,
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier.fillMaxSize()
+                        )
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .background(
+                                    Brush.verticalGradient(
+                                        colors = listOf(Color.Transparent, Color(0x99000000))
+                                    )
+                                )
+                        )
+                        Text(
+                            text = "${((details?.confidence ?: 0f) * 100).toInt()}%",
+                            color = Color.White,
+                            style = MaterialTheme.typography.labelLarge,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier
+                                .align(Alignment.BottomEnd)
+                                .padding(8.dp)
+                        )
+                    }
+                }
+                if (rowItems.size == 1) {
+                    Spacer(modifier = Modifier.weight(1f))
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ImageProfileDialog(
+    screenshot: Screenshot,
+    details: ClassifiedImage,
+    onDismiss: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("Close") }
+        },
+        title = {
+            Text(
+                text = "Image profile",
+                color = Color(0xFF102A43),
+                fontWeight = FontWeight.SemiBold
+            )
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                AsyncImage(
+                    model = screenshot.uri,
+                    contentDescription = screenshot.displayName,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(190.dp)
+                        .clip(androidx.compose.foundation.shape.RoundedCornerShape(14.dp))
+                )
+
+                Surface(
+                    color = categoryColor(details.category),
+                    shape = androidx.compose.foundation.shape.RoundedCornerShape(14.dp)
+                ) {
+                    Text(
+                        text = details.category,
+                        color = Color.White,
+                        fontWeight = FontWeight.Medium,
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
+                    )
+                }
+
+                Text("Confidence: ${((details.confidence * 100).toInt())}%")
+                if (details.description.isNotBlank()) {
+                    Text("Description: ${details.description}")
+                }
+                HorizontalDivider(color = Color(0xFFE2E8F0))
+                Text("Image id: ${details.imageId}", style = MaterialTheme.typography.bodySmall)
+                Text("URI: ${details.imageUri}", style = MaterialTheme.typography.bodySmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                Text(
+                    "Updated: ${DateFormat.format("dd MMM yyyy, hh:mm a", details.updatedAt)}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color(0xFF4A6572)
+                )
+            }
+        }
+    )
+}
+
+@Composable
+private fun CategoryCollectionSkeleton() {
+    val shimmer = rememberInfiniteTransition(label = "categorySkeleton")
+    val alpha by shimmer.animateFloat(
+        initialValue = 0.45f,
+        targetValue = 0.9f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 850),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "categorySkeletonAlpha"
+    )
+
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth(0.55f)
+                    .height(24.dp)
+                    .clip(androidx.compose.foundation.shape.RoundedCornerShape(8.dp))
+                    .background(Color(0xFFDCE9E8).copy(alpha = alpha))
+            )
+            Box(
+                modifier = Modifier
+                    .size(width = 62.dp, height = 20.dp)
+                    .clip(androidx.compose.foundation.shape.RoundedCornerShape(8.dp))
+                    .background(Color(0xFFDCE9E8).copy(alpha = alpha))
+            )
+        }
+
+        repeat(2) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                repeat(2) {
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .aspectRatio(1.22f)
+                            .clip(androidx.compose.foundation.shape.RoundedCornerShape(16.dp))
+                            .background(Color(0xFFDCE9E8).copy(alpha = alpha))
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CategoryGallerySkeleton() {
+    val shimmer = rememberInfiniteTransition(label = "gallerySkeleton")
+    val alpha by shimmer.animateFloat(
+        initialValue = 0.45f,
+        targetValue = 0.9f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 850),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "gallerySkeletonAlpha"
+    )
+
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        repeat(2) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                repeat(2) {
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .aspectRatio(1f)
+                            .clip(androidx.compose.foundation.shape.RoundedCornerShape(16.dp))
+                            .background(Color(0xFFDCE9E8).copy(alpha = alpha))
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ScreenshotListSkeleton() {
+    val shimmer = rememberInfiniteTransition(label = "listSkeleton")
+    val alpha by shimmer.animateFloat(
+        initialValue = 0.45f,
+        targetValue = 0.9f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 850),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "listSkeletonAlpha"
+    )
+
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        repeat(3) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(androidx.compose.foundation.shape.RoundedCornerShape(14.dp))
+                    .background(Color(0xFFF3F7F7))
+                    .padding(12.dp),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(92.dp)
+                        .clip(androidx.compose.foundation.shape.RoundedCornerShape(10.dp))
+                        .background(Color(0xFFDCE9E8).copy(alpha = alpha))
+                )
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth(0.65f)
+                            .height(16.dp)
+                            .clip(androidx.compose.foundation.shape.RoundedCornerShape(6.dp))
+                            .background(Color(0xFFDCE9E8).copy(alpha = alpha))
+                    )
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth(0.5f)
+                            .height(12.dp)
+                            .clip(androidx.compose.foundation.shape.RoundedCornerShape(6.dp))
+                            .background(Color(0xFFDCE9E8).copy(alpha = alpha))
+                    )
+                }
+            }
+        }
+    }
+}
+
+private fun buildPromptPreview(categories: List<String>, customPrompt: String): String = buildString {
+    appendLine("You classify one screenshot into exactly one allowed category.")
+    appendLine()
+    appendLine("Allowed categories: ${categories.joinToString(", ")}")
+    appendLine()
+    appendLine("Category definitions:")
+    categories.forEach { category ->
+        appendLine("- $category: ${promptCategoryDefinition(category)}")
+    }
+    appendLine()
+    appendLine("Rules:")
+    appendLine("1. Return exactly one category from the allowed list, preserving its spelling.")
+    appendLine("2. Choose the most specific matching category. Use Others only when no other category fits.")
+    appendLine("3. Prioritize meaningful readable text and the primary subject over background scenery.")
+
+    categories.findCategoryName("Quotes/Learning")?.let { quotesCategory ->
+        appendLine(
+            "4. Choose $quotesCategory when the primary content is a quote, lesson, educational text, " +
+                "study material, tutorial, or explanation. Do this even if it was shared on a social-media app."
+        )
+    }
+    categories.findCategoryName("Only people no text", "People")?.let { peopleCategory ->
+        appendLine(
+            "5. Choose $peopleCategory when people are the primary subject and there is no meaningful " +
+                "text that clearly fits another category. Ignore tiny incidental text like watermarks, " +
+                "status-bar labels, camera overlays, or single-word UI labels."
+        )
+    }
+    categories.findCategoryName("QR")?.let { qrCategory ->
+        appendLine("6. Choose $qrCategory when a QR code is clearly visible, even when other content is present.")
+    }
+    categories.findCategoryName("Maps")?.let { mapsCategory ->
+        appendLine("7. Choose $mapsCategory when a map or navigation interface is visible.")
+    }
+    categories.findCategoryName("Payment/Finance/Bills")?.let { financeCategory ->
+        appendLine(
+            "8. Choose $financeCategory for payment, banking, invoices, bills, balances, or transactions " +
+                "when they are the main content."
+        )
+    }
+    categories.findCategoryName("Comment Section (YouTube / Instagram)")?.let { commentsCategory ->
+        appendLine(
+            "9. Choose $commentsCategory only when an actual comment thread is visible, such as multiple " +
+                "comments or replies with user names, avatars, timestamps, likes, or reply controls. Do not " +
+                "choose it for a standalone quote, caption, post, or image just because it came from YouTube or Instagram."
+        )
+    }
+    categories.findCategoryName("Greeting Messages (Good morning etc)")?.let { greetingCategory ->
+        appendLine("10. Choose $greetingCategory when greeting, blessing, festival, or good-morning text is the main content.")
+    }
+    categories.findCategoryName("Nature/Plants")?.let { natureCategory ->
+        appendLine("11. Choose $natureCategory only when nature is the primary subject and no person is present.")
+    }
+    appendLine("12. Custom instructions below override these baseline rules when they conflict.")
+    appendLine()
+    appendLine("Custom instructions: ${customPrompt.trim().ifBlank { "None" }}")
+    appendLine()
+    appendLine("13. Also provide a very short plain-language description of the screenshot in at most 12 words.")
+    append("Return JSON only, with no explanation: {\"category\":\"${categories.firstOrNull() ?: "Others"}\",\"confidence\":0.0,\"description\":\"brief summary\"}")
+}
+
+private fun List<String>.findCategoryName(vararg names: String): String? = firstOrNull { category ->
+    names.any { category.equals(it, ignoreCase = true) }
+}
+
+private fun promptCategoryDefinition(category: String): String = when (category.lowercase()) {
+    "linkedin" -> "LinkedIn posts, profiles, jobs, professional updates, or workplace content."
+    "quotes/learning" -> "Quotes, study material, educational notes, tutorials, or useful explanations."
+    "food" -> "Meals, recipes, restaurant menus, cooking, or food and drink products."
+    "payment/finance/bills" -> "Payments, banking, invoices, bills, balances, transactions, or financial notices."
+    "identity cards" -> "Official identity documents such as Aadhaar cards, PAN cards, voter IDs, passports, driving licences, or similar IDs."
+    "qr" -> "A QR code intended to be scanned."
+    "comment section (youtube / instagram)" -> "YouTube, Instagram, or other social-media comments, replies, or discussions."
+    "nature/plants" -> "Plants, landscapes, flowers, outdoor scenery, or other nature-focused images."
+    "only people no text" -> "People are the main subject. Small incidental text is okay, but do not use this when meaningful text should drive another category."
+    "games (bgmi etc)" -> "Game play, game menus, scores, game characters, or gaming-related content."
+    "maps" -> "Maps, directions, navigation, routes, or location interfaces."
+    "greeting messages (good morning etc)" -> "Greeting, blessing, festival, good-morning, or good-night messages."
+    "animals" -> "Animals are the primary subject."
+    "others" -> "Anything that does not fit another category."
+    else -> "Content that best matches the category name: $category."
+}
+
+private val categoryColors = listOf(
+    Color(0xFF0E6B6E), Color(0xFFB85450), Color(0xFF8A5D16), Color(0xFF5B6EA6),
+    Color(0xFF7B4B94), Color(0xFF34745A), Color(0xFFAA5C27), Color(0xFF4A718C)
+)
+
+private fun categoryColor(category: String): Color =
+    categoryColors[(category.hashCode() and Int.MAX_VALUE) % categoryColors.size]
