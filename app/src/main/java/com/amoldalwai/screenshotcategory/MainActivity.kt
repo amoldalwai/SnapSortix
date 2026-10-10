@@ -69,6 +69,7 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.lightColorScheme
@@ -181,7 +182,7 @@ class MainActivity : ComponentActivity() {
                     if (imageUri.isBlank()) continue
                     val confidence = item.optDouble("confidence", 0.0).toFloat().coerceIn(0f, 1f)
                     put(
-                        UriKey(imageUri),
+                        uriKeyFor(imageUri),
                         ClassifiedImage(
                             imageId = item.optString("imageId").ifBlank { imageUri },
                             imageUri = imageUri,
@@ -235,6 +236,16 @@ class MainActivity : ComponentActivity() {
         }
     }.getOrElse { false }
 
+    private fun uriKeyFor(rawUri: String): UriKey {
+        return UriKey(canonicalizeMediaStoreUriKey(rawUri))
+    }
+
+    private fun canonicalizeMediaStoreUriKey(raw: String): String {
+        return raw
+            .replace("content://media/external/images/media/", "content://media/external_primary/images/media/")
+            .replace("content://media/external/video/media/", "content://media/external_primary/video/media/")
+    }
+
     private fun persistGalleryUriPermission(uri: Uri): Boolean = runCatching {
         contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
         true
@@ -255,10 +266,10 @@ class MainActivity : ComponentActivity() {
         persisted: Map<UriKey, ClassifiedImage>
     ): List<Screenshot> {
         val dedupedScanned = scanned.distinctBy { it.uri.toString() }
-        val existing = dedupedScanned.map { UriKey(it.uri.toString()) }.toSet()
+        val existing = dedupedScanned.map { uriKeyFor(it.uri.toString()) }.toSet()
         val restored = persisted.values
             .filter { uriStillExists(it.imageUri) }
-            .filterNot { UriKey(it.imageUri) in existing }
+            .filterNot { uriKeyFor(it.imageUri) in existing }
             .map { saved ->
                 Screenshot(
                     imageId = saved.imageId,
@@ -293,7 +304,9 @@ class MainActivity : ComponentActivity() {
         var batchTotal by remember { mutableStateOf(0) }
         var batchStartEpochMs by remember { mutableStateOf<Long?>(null) }
         var batchStageMessage by remember { mutableStateOf<String?>(null) }
-        var isBackgroundClassifying by remember { mutableStateOf(BackgroundClassificationService.isRunning) }
+        var isBackgroundClassifying by remember { mutableStateOf(BackgroundClassificationService.isBatchRunning) }
+        var isWatcherRunning by remember { mutableStateOf(BackgroundClassificationService.isWatcherRunning) }
+        var watcherQueueCount by remember { mutableStateOf(BackgroundClassificationService.queuedCount) }
         var backgroundProgressSummary by remember { mutableStateOf(BackgroundClassificationService.progressSummary) }
         var backgroundDone by remember { mutableStateOf(BackgroundClassificationService.progressDone) }
         var backgroundTotal by remember { mutableStateOf(BackgroundClassificationService.progressTotal) }
@@ -435,7 +448,9 @@ class MainActivity : ComponentActivity() {
 
         LaunchedEffect(Unit) {
             while (true) {
-                isBackgroundClassifying = BackgroundClassificationService.isRunning
+                isBackgroundClassifying = BackgroundClassificationService.isBatchRunning
+                isWatcherRunning = BackgroundClassificationService.isWatcherRunning
+                watcherQueueCount = BackgroundClassificationService.queuedCount
                 backgroundProgressSummary = BackgroundClassificationService.progressSummary
                 backgroundDone = BackgroundClassificationService.progressDone
                 backgroundTotal = BackgroundClassificationService.progressTotal
@@ -449,7 +464,7 @@ class MainActivity : ComponentActivity() {
                 activeTokenBudget = BackgroundClassificationService.activeTokenBudget
                 activeResizeLongSidePx = BackgroundClassificationService.activeResizeLongSidePx
 
-                if (isBackgroundClassifying) {
+                if (isBackgroundClassifying || isWatcherRunning) {
                     val latest = withContext(Dispatchers.IO) { loadClassificationsFromDisk() }
                     if (latest.size != classifications.size) {
                         classifications = latest
@@ -465,7 +480,7 @@ class MainActivity : ComponentActivity() {
                 val backendGpuPercent = 50
 
                 suspend fun classifyAndPersist(screenshot: Screenshot): Boolean {
-                    val imageKey = UriKey(screenshot.uri.toString())
+                    val imageKey = uriKeyFor(screenshot.uri.toString())
                     activeClassification = imageKey
                     val result = runCatching {
                         withContext(Dispatchers.IO) {
@@ -501,7 +516,7 @@ class MainActivity : ComponentActivity() {
 
                 val isSearchView = searchQuery.trim().isNotEmpty()
                 val filteredScreenshots = screenshots.filter { screenshot ->
-                    val classification = classifications[UriKey(screenshot.uri.toString())]
+                    val classification = classifications[uriKeyFor(screenshot.uri.toString())]
                     val categoryMatches = selectedCategory == null || classification?.category == selectedCategory
                     val requiresClassifiedImage = showAllGallery || isSearchView
                     val allGalleryMatches = !requiresClassifiedImage || classification != null
@@ -515,13 +530,13 @@ class MainActivity : ComponentActivity() {
                 }
 
                 val collectionItems = filteredScreenshots.mapNotNull { screenshot ->
-                    val classification = classifications[UriKey(screenshot.uri.toString())] ?: return@mapNotNull null
+                    val classification = classifications[uriKeyFor(screenshot.uri.toString())] ?: return@mapNotNull null
                     screenshot to classification
                 }
                 val groupedCollections = collectionItems.groupBy { (_, classification) -> classification.category }
                 val totalScreenshotsCount = screenshots.size
                 val classifiedScreenshotsCount = screenshots.count {
-                    UriKey(it.uri.toString()) in classifications
+                    uriKeyFor(it.uri.toString()) in classifications
                 }
 
                 Box(
@@ -588,6 +603,7 @@ class MainActivity : ComponentActivity() {
                         PromptSettings(
                             customPrompt = draftCustomPrompt,
                             visionMode = draftVisionMode,
+                            autoDetectEnabled = isWatcherRunning,
                             promptPreview = buildPromptPreview(savedCategories, draftCustomPrompt),
                             onBack = {
                                 if (draftCustomPrompt != savedCustomPrompt || draftVisionMode != savedVisionMode) {
@@ -598,6 +614,37 @@ class MainActivity : ComponentActivity() {
                             },
                             onCustomPromptChange = { draftCustomPrompt = it },
                             onVisionModeChange = { draftVisionMode = it },
+                            onAutoDetectToggle = { enabled ->
+                                if (enabled) {
+                                    if (!modelDownload.isReady()) {
+                                        status = "Download the model first."
+                                    } else if (ContextCompat.checkSelfPermission(
+                                        this@MainActivity,
+                                        Manifest.permission.READ_MEDIA_IMAGES
+                                    ) != PackageManager.PERMISSION_GRANTED) {
+                                        permissionLauncher.launch(Manifest.permission.READ_MEDIA_IMAGES)
+                                        status = "Grant image permission to enable auto detect."
+                                    } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                        val hasNotificationPermission = ContextCompat.checkSelfPermission(
+                                            this@MainActivity,
+                                            Manifest.permission.POST_NOTIFICATIONS
+                                        ) == PackageManager.PERMISSION_GRANTED
+                                        if (!hasNotificationPermission) {
+                                            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                                            status = "Grant notification permission to enable auto detect."
+                                        } else {
+                                            BackgroundClassificationService.startWatcher(this@MainActivity)
+                                            status = "Auto detect enabled. New screenshots will be queued and classified in background."
+                                        }
+                                    } else {
+                                        BackgroundClassificationService.startWatcher(this@MainActivity)
+                                        status = "Auto detect enabled. New screenshots will be queued and classified in background."
+                                    }
+                                } else {
+                                    BackgroundClassificationService.stop(this@MainActivity)
+                                    status = "Auto detect disabled."
+                                }
+                            },
                             onSave = {
                                 savedCustomPrompt = saveCustomPrompt(draftCustomPrompt)
                                 savedVisionMode = saveVisionMode(draftVisionMode)
@@ -787,6 +834,39 @@ class MainActivity : ComponentActivity() {
                                     }
                                 }
                             }
+                            if (isWatcherRunning && !isBackgroundClassifying) {
+                                item {
+                                    Card(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        colors = CardDefaults.cardColors(containerColor = Color(0xFFEFF6FF)),
+                                        shape = androidx.compose.foundation.shape.RoundedCornerShape(14.dp)
+                                    ) {
+                                        Column(
+                                            modifier = Modifier.padding(12.dp),
+                                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                                        ) {
+                                            Text(
+                                                text = "Auto watch is active",
+                                                style = MaterialTheme.typography.bodyMedium,
+                                                color = Color(0xFF1E3A5F),
+                                                fontWeight = FontWeight.SemiBold
+                                            )
+                                            Text(
+                                                text = "Watching screenshot captures. Queue: $watcherQueueCount pending",
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = Color(0xFF355C7D)
+                                            )
+                                            if (backgroundProgressSummary.isNotBlank()) {
+                                                Text(
+                                                    text = backgroundProgressSummary,
+                                                    style = MaterialTheme.typography.bodySmall,
+                                                    color = Color(0xFF2F6E6A)
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             item {
                                 Row(
                                     horizontalArrangement = Arrangement.spacedBy(16.dp),
@@ -841,7 +921,7 @@ class MainActivity : ComponentActivity() {
                                             }
 
                                             val pending = screenshots.filter { shot ->
-                                                UriKey(shot.uri.toString()) !in classifications
+                                                uriKeyFor(shot.uri.toString()) !in classifications
                                             }.take(10)
                                             if (pending.isEmpty()) {
                                                 status = "No uncategorized screenshots available in top 10."
@@ -987,7 +1067,7 @@ class MainActivity : ComponentActivity() {
                                             screenshots = filteredScreenshots,
                                             classifications = classifications,
                                             onImageClick = { screenshot ->
-                                                val details = classifications[UriKey(screenshot.uri.toString())]
+                                                val details = classifications[uriKeyFor(screenshot.uri.toString())]
                                                 if (details != null) {
                                                     selectedImageProfile = screenshot to details
                                                 }
@@ -1008,12 +1088,12 @@ class MainActivity : ComponentActivity() {
                                     item {
                                         ScreenshotRow(
                                             screenshot = galleryImage,
-                                            classification = classifications[UriKey(galleryImage.uri.toString())]?.toClassification(),
+                                            classification = classifications[uriKeyFor(galleryImage.uri.toString())]?.toClassification(),
                                             enabled = modelDownload.isReady() && activeClassification == null && !isModelPreparing && !isBatchClassifying,
-                                            isClassifying = activeClassification == UriKey(galleryImage.uri.toString()),
-                                            isReclassifying = activeReclassification == UriKey(galleryImage.uri.toString()),
+                                            isClassifying = activeClassification == uriKeyFor(galleryImage.uri.toString()),
+                                            isReclassifying = activeReclassification == uriKeyFor(galleryImage.uri.toString()),
                                             onEditClick = {
-                                                val details = classifications[UriKey(galleryImage.uri.toString())]
+                                                val details = classifications[uriKeyFor(galleryImage.uri.toString())]
                                                 if (details != null) {
                                                     selectedImageProfile = galleryImage to details
                                                 } else {
@@ -1022,7 +1102,7 @@ class MainActivity : ComponentActivity() {
                                             },
                                             onReclassifyClick = {
                                                 lifecycleScope.launch {
-                                                    val imageKey = UriKey(galleryImage.uri.toString())
+                                                    val imageKey = uriKeyFor(galleryImage.uri.toString())
                                                     activeReclassification = imageKey
                                                     status = if (classifier == null) {
                                                         "Preparing Gemma for re-classification."
@@ -1095,9 +1175,9 @@ class MainActivity : ComponentActivity() {
                             screenshot = screenshot,
                             details = details,
                             categories = savedCategories,
-                            isReclassifying = activeReclassification == UriKey(screenshot.uri.toString()),
+                            isReclassifying = activeReclassification == uriKeyFor(screenshot.uri.toString()),
                             onSaveEdits = { updatedCategory, updatedDescription ->
-                                val imageKey = UriKey(screenshot.uri.toString())
+                                val imageKey = uriKeyFor(screenshot.uri.toString())
                                 val existing = classifications[imageKey] ?: return@ImageProfileDialog false
                                 val updatedEntry = existing.copy(
                                     category = updatedCategory,
@@ -1115,7 +1195,7 @@ class MainActivity : ComponentActivity() {
                             },
                             onReclassify = {
                                 lifecycleScope.launch {
-                                    val imageKey = UriKey(screenshot.uri.toString())
+                                    val imageKey = uriKeyFor(screenshot.uri.toString())
                                     activeReclassification = imageKey
                                     status = if (classifier == null) {
                                         "Preparing Gemma for re-classification."
@@ -1125,7 +1205,7 @@ class MainActivity : ComponentActivity() {
                                     val savedToDisk = classifyAndPersist(screenshot)
                                     activeReclassification = null
                                     if (savedToDisk) {
-                                        val latest = classifications[UriKey(screenshot.uri.toString())]
+                                        val latest = classifications[uriKeyFor(screenshot.uri.toString())]
                                         if (latest != null) {
                                             selectedImageProfile = screenshot to latest
                                         }
@@ -1331,10 +1411,12 @@ private fun normalizeCategories(categories: List<String>): List<String> =
 private fun PromptSettings(
     customPrompt: String,
     visionMode: VisionMode,
+    autoDetectEnabled: Boolean,
     promptPreview: String,
     onBack: () -> Unit,
     onCustomPromptChange: (String) -> Unit,
     onVisionModeChange: (VisionMode) -> Unit,
+    onAutoDetectToggle: (Boolean) -> Unit,
     onSave: () -> Unit,
     onReset: () -> Unit
 ) {
@@ -1446,6 +1528,41 @@ private fun PromptSettings(
                     modifier = Modifier.fillMaxWidth(),
                     minLines = 8,
                     maxLines = 14
+                )
+            }
+        }
+
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            shape = androidx.compose.foundation.shape.RoundedCornerShape(8.dp),
+            colors = CardDefaults.cardColors(containerColor = Color(0xFFEFF6FF))
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(12.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    Text(
+                        "Auto detect screenshots",
+                        style = MaterialTheme.typography.titleMedium,
+                        color = Color(0xFF102A43),
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Text(
+                        "Keeps a lightweight watcher active and classifies new screenshots in background.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color(0xFF355C7D)
+                    )
+                }
+                Switch(
+                    checked = autoDetectEnabled,
+                    onCheckedChange = onAutoDetectToggle
                 )
             }
         }
