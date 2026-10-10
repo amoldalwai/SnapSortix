@@ -4,14 +4,15 @@ import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.provider.MediaStore
+import android.provider.Settings
 import android.net.Uri
 import android.os.Bundle
+import android.os.Build
 import android.text.format.DateFormat
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
@@ -20,6 +21,7 @@ import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.border
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.background
@@ -33,6 +35,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
@@ -42,6 +45,7 @@ import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.AutoAwesome
 import androidx.compose.material.icons.outlined.Check
 import androidx.compose.material.icons.outlined.Close
+import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.PhotoLibrary
 import androidx.compose.material.icons.outlined.Refresh
@@ -120,7 +124,14 @@ class MainActivity : ComponentActivity() {
             return savedCategories
         }
 
-        val updatedCategories = normalizeCategories(savedCategories + IDENTITY_CARDS_CATEGORY)
+        val updatedCategories = normalizeCategories(
+            savedCategories + listOf(
+                IDENTITY_CARDS_CATEGORY,
+                MOVIE_CATEGORY,
+                TICKETS_CATEGORY,
+                OTP_CATEGORY
+            )
+        )
         preferences.edit()
             .putString(CATEGORY_PREFERENCES_KEY, updatedCategories.joinToString("\n"))
             .putInt(CATEGORY_DEFAULTS_VERSION_KEY, CATEGORY_DEFAULTS_VERSION)
@@ -142,6 +153,16 @@ class MainActivity : ComponentActivity() {
         val normalized = prompt.trim()
         preferences.edit().putString(CUSTOM_PROMPT_PREFERENCES_KEY, normalized).apply()
         return normalized
+    }
+
+    private fun loadVisionMode(): VisionMode {
+        val saved = preferences.getString(VISION_MODE_PREFERENCES_KEY, VisionMode.SuperFast.name)
+        return VisionMode.entries.firstOrNull { it.name == saved } ?: VisionMode.SuperFast
+    }
+
+    private fun saveVisionMode(mode: VisionMode): VisionMode {
+        preferences.edit().putString(VISION_MODE_PREFERENCES_KEY, mode.name).apply()
+        return mode
     }
 
     private fun resetCategories(): List<String> {
@@ -233,7 +254,8 @@ class MainActivity : ComponentActivity() {
         scanned: List<Screenshot>,
         persisted: Map<UriKey, ClassifiedImage>
     ): List<Screenshot> {
-        val existing = scanned.map { UriKey(it.uri.toString()) }.toSet()
+        val dedupedScanned = scanned.distinctBy { it.uri.toString() }
+        val existing = dedupedScanned.map { UriKey(it.uri.toString()) }.toSet()
         val restored = persisted.values
             .filter { uriStillExists(it.imageUri) }
             .filterNot { UriKey(it.imageUri) in existing }
@@ -245,7 +267,7 @@ class MainActivity : ComponentActivity() {
                     relativePath = "Saved"
                 )
             }
-        return scanned + restored
+        return (dedupedScanned + restored).distinctBy { it.uri.toString() }
     }
 
     @Composable
@@ -254,9 +276,15 @@ class MainActivity : ComponentActivity() {
         var screenshots by remember { mutableStateOf(emptyList<Screenshot>()) }
         var savedCategories by remember { mutableStateOf(loadCategories()) }
         var savedCustomPrompt by remember { mutableStateOf(loadCustomPrompt()) }
+        var savedVisionMode by remember { mutableStateOf(loadVisionMode()) }
         var draftCustomPrompt by remember { mutableStateOf(savedCustomPrompt) }
+        var draftVisionMode by remember { mutableStateOf(savedVisionMode) }
         var showSettings by remember { mutableStateOf(false) }
         var showDiscardChanges by remember { mutableStateOf(false) }
+        var showDeleteAllClassificationsDialog by remember { mutableStateOf(false) }
+        var showPhoneScreenshotPicker by remember { mutableStateOf(false) }
+        var phoneScreenshotPickerItems by remember { mutableStateOf(emptyList<Screenshot>()) }
+        var isPhoneScreenshotPickerLoading by remember { mutableStateOf(false) }
         var activeClassification by remember { mutableStateOf<UriKey?>(null) }
         var activeReclassification by remember { mutableStateOf<UriKey?>(null) }
         var isModelPreparing by remember { mutableStateOf(false) }
@@ -265,6 +293,19 @@ class MainActivity : ComponentActivity() {
         var batchTotal by remember { mutableStateOf(0) }
         var batchStartEpochMs by remember { mutableStateOf<Long?>(null) }
         var batchStageMessage by remember { mutableStateOf<String?>(null) }
+        var isBackgroundClassifying by remember { mutableStateOf(BackgroundClassificationService.isRunning) }
+        var backgroundProgressSummary by remember { mutableStateOf(BackgroundClassificationService.progressSummary) }
+        var backgroundDone by remember { mutableStateOf(BackgroundClassificationService.progressDone) }
+        var backgroundTotal by remember { mutableStateOf(BackgroundClassificationService.progressTotal) }
+        var averageDecodeMs by remember { mutableStateOf(BackgroundClassificationService.averageDecodeMs) }
+        var averageInferenceMs by remember { mutableStateOf(BackgroundClassificationService.averageInferenceMs) }
+        var averageSaveMs by remember { mutableStateOf(BackgroundClassificationService.averageSaveMs) }
+        var runtimeBackend by remember { mutableStateOf(BackgroundClassificationService.runtimeBackend) }
+        var dominantStage by remember { mutableStateOf(BackgroundClassificationService.dominantStage) }
+        var optimizationHint by remember { mutableStateOf(BackgroundClassificationService.optimizationHint) }
+        var activeVisionModeLabel by remember { mutableStateOf(BackgroundClassificationService.activeVisionMode) }
+        var activeTokenBudget by remember { mutableStateOf(BackgroundClassificationService.activeTokenBudget) }
+        var activeResizeLongSidePx by remember { mutableStateOf(BackgroundClassificationService.activeResizeLongSidePx) }
         var searchQuery by remember { mutableStateOf("") }
         var isSearchResultsLoading by remember { mutableStateOf(false) }
         var selectedCategory by remember { mutableStateOf<String?>(null) }
@@ -290,7 +331,8 @@ class MainActivity : ComponentActivity() {
             if (!granted) {
                 isCategorySectionLoading = false
                 isScreenshotSectionLoading = false
-                status = "Image permission is required to scan screenshots."
+                status = "Image permission is required. Opening app settings so you can enable it."
+                openAppPermissionSettings()
                 return@rememberLauncherForActivityResult
             }
             isCategorySectionLoading = true
@@ -304,6 +346,14 @@ class MainActivity : ComponentActivity() {
                     isCategorySectionLoading = false
                     isScreenshotSectionLoading = false
                 }
+            }
+        }
+        val notificationPermissionLauncher = rememberLauncherForActivityResult(
+            ActivityResultContracts.RequestPermission()
+        ) { granted ->
+            if (!granted) {
+                status = "Notification permission is required for progress popups. Opening notification settings."
+                openNotificationSettings()
             }
         }
         val galleryPicker = rememberLauncherForActivityResult(
@@ -326,27 +376,6 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
-        val phoneGalleryPicker = rememberLauncherForActivityResult(
-            ActivityResultContracts.PickVisualMedia()
-        ) { selectedUri ->
-            if (selectedUri != null) {
-                val permissionPersisted = persistGalleryUriPermission(selectedUri)
-                val selectedImage = Screenshot(
-                    imageId = selectedUri.lastPathSegment ?: selectedUri.toString(),
-                    uri = selectedUri,
-                    displayName = "Selected phone gallery image",
-                    relativePath = "Phone Gallery"
-                )
-                selectedGalleryImage = selectedImage
-                screenshots = listOf(selectedImage) + screenshots.filterNot { it.uri == selectedUri }
-                status = if (permissionPersisted) {
-                    "Phone gallery image added. It will remain available after app restart."
-                } else {
-                    "Phone gallery image added. If persistence fails for this picker, use Gallery for guaranteed restart-safe selection."
-                }
-            }
-        }
-
         LaunchedEffect(modelDownload.isReady()) {
             if (!modelDownload.isReady() || classifier != null || isModelPreparing) return@LaunchedEffect
             isModelPreparing = true
@@ -404,6 +433,32 @@ class MainActivity : ComponentActivity() {
             isSearchResultsLoading = false
         }
 
+        LaunchedEffect(Unit) {
+            while (true) {
+                isBackgroundClassifying = BackgroundClassificationService.isRunning
+                backgroundProgressSummary = BackgroundClassificationService.progressSummary
+                backgroundDone = BackgroundClassificationService.progressDone
+                backgroundTotal = BackgroundClassificationService.progressTotal
+                averageDecodeMs = BackgroundClassificationService.averageDecodeMs
+                averageInferenceMs = BackgroundClassificationService.averageInferenceMs
+                averageSaveMs = BackgroundClassificationService.averageSaveMs
+                runtimeBackend = BackgroundClassificationService.runtimeBackend
+                dominantStage = BackgroundClassificationService.dominantStage
+                optimizationHint = BackgroundClassificationService.optimizationHint
+                activeVisionModeLabel = BackgroundClassificationService.activeVisionMode
+                activeTokenBudget = BackgroundClassificationService.activeTokenBudget
+                activeResizeLongSidePx = BackgroundClassificationService.activeResizeLongSidePx
+
+                if (isBackgroundClassifying) {
+                    val latest = withContext(Dispatchers.IO) { loadClassificationsFromDisk() }
+                    if (latest.size != classifications.size) {
+                        classifications = latest
+                    }
+                }
+                delay(500)
+            }
+        }
+
         MaterialTheme(colorScheme = screenshotSorterColors) {
             Scaffold(containerColor = MaterialTheme.colorScheme.surface) { padding ->
                 val backendCpuPercent = 50
@@ -421,7 +476,8 @@ class MainActivity : ComponentActivity() {
                             activeClassifier.classify(
                                 screenshot.uri,
                                 savedCategories,
-                                savedCustomPrompt
+                                savedCustomPrompt,
+                                savedVisionMode
                             )
                         }
                     }
@@ -517,6 +573,7 @@ class MainActivity : ComponentActivity() {
                         }
                         IconButton(onClick = {
                             draftCustomPrompt = savedCustomPrompt
+                            draftVisionMode = savedVisionMode
                             showSettings = true
                         }) {
                             Icon(
@@ -530,23 +587,28 @@ class MainActivity : ComponentActivity() {
                     if (showSettings) {
                         PromptSettings(
                             customPrompt = draftCustomPrompt,
+                            visionMode = draftVisionMode,
                             promptPreview = buildPromptPreview(savedCategories, draftCustomPrompt),
                             onBack = {
-                                if (draftCustomPrompt != savedCustomPrompt) {
+                                if (draftCustomPrompt != savedCustomPrompt || draftVisionMode != savedVisionMode) {
                                     showDiscardChanges = true
                                 } else {
                                     showSettings = false
                                 }
                             },
                             onCustomPromptChange = { draftCustomPrompt = it },
+                            onVisionModeChange = { draftVisionMode = it },
                             onSave = {
                                 savedCustomPrompt = saveCustomPrompt(draftCustomPrompt)
+                                savedVisionMode = saveVisionMode(draftVisionMode)
                                 draftCustomPrompt = savedCustomPrompt
+                                draftVisionMode = savedVisionMode
                                 showSettings = false
-                                status = "Prompt saved."
+                                status = "Prompt saved. Vision mode set to ${savedVisionMode.label}."
                             },
                             onReset = {
                                 draftCustomPrompt = ""
+                                draftVisionMode = VisionMode.SuperFast
                             }
                         )
                         if (showDiscardChanges) {
@@ -557,6 +619,7 @@ class MainActivity : ComponentActivity() {
                                 confirmButton = {
                                     TextButton(onClick = {
                                         draftCustomPrompt = savedCustomPrompt
+                                        draftVisionMode = savedVisionMode
                                         showDiscardChanges = false
                                         showSettings = false
                                     }) { Text("Yes") }
@@ -647,6 +710,83 @@ class MainActivity : ComponentActivity() {
                                     }
                                 }
                             }
+                            if (isBackgroundClassifying) {
+                                item {
+                                    Card(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        colors = CardDefaults.cardColors(containerColor = Color(0xFFEFF6FF)),
+                                        shape = androidx.compose.foundation.shape.RoundedCornerShape(14.dp)
+                                    ) {
+                                        Column(
+                                            modifier = Modifier.padding(12.dp),
+                                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                                        ) {
+                                            Text(
+                                                text = "Background classify is running",
+                                                style = MaterialTheme.typography.bodyMedium,
+                                                color = Color(0xFF1E3A5F),
+                                                fontWeight = FontWeight.SemiBold
+                                            )
+                                            if (backgroundProgressSummary.isNotBlank()) {
+                                                Text(
+                                                    text = backgroundProgressSummary,
+                                                    style = MaterialTheme.typography.bodySmall,
+                                                    color = Color(0xFF355C7D)
+                                                )
+                                            }
+                                            if (backgroundTotal > 0) {
+                                                LinearProgressIndicator(
+                                                    progress = {
+                                                        (backgroundDone.toFloat() / backgroundTotal.toFloat()).coerceIn(0f, 1f)
+                                                    },
+                                                    modifier = Modifier.fillMaxWidth(),
+                                                    color = Color(0xFF2F6E6A),
+                                                    trackColor = Color(0xFFD6E4F3)
+                                                )
+                                                Text(
+                                                    text = "Progress: $backgroundDone/$backgroundTotal",
+                                                    style = MaterialTheme.typography.bodySmall,
+                                                    color = Color(0xFF355C7D)
+                                                )
+                                            }
+                                            Text(
+                                                text = "decode/downscale avg: ${averageDecodeMs} ms | inference avg: ${averageInferenceMs} ms | save avg: ${averageSaveMs} ms",
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = Color(0xFF355C7D)
+                                            )
+                                            if (runtimeBackend.isNotBlank()) {
+                                                Text(
+                                                    text = "Runtime in use: $runtimeBackend",
+                                                    style = MaterialTheme.typography.bodySmall,
+                                                    color = Color(0xFF1E3A5F)
+                                                )
+                                            }
+                                            if (activeVisionModeLabel.isNotBlank()) {
+                                                Text(
+                                                    text = "Mode: $activeVisionModeLabel | Token budget: $activeTokenBudget | Resize: ${activeResizeLongSidePx}px",
+                                                    style = MaterialTheme.typography.bodySmall,
+                                                    color = Color(0xFF1E3A5F)
+                                                )
+                                            }
+                                            if (dominantStage.isNotBlank()) {
+                                                Text(
+                                                    text = "Dominant stage: $dominantStage",
+                                                    style = MaterialTheme.typography.bodySmall,
+                                                    color = Color(0xFF1E3A5F),
+                                                    fontWeight = FontWeight.SemiBold
+                                                )
+                                            }
+                                            if (optimizationHint.isNotBlank()) {
+                                                Text(
+                                                    text = optimizationHint,
+                                                    style = MaterialTheme.typography.bodySmall,
+                                                    color = Color(0xFF2F6E6A)
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             item {
                                 Row(
                                     horizontalArrangement = Arrangement.spacedBy(16.dp),
@@ -677,17 +817,29 @@ class MainActivity : ComponentActivity() {
                                         )
                                     }
                                     QuickAction(
-                                        icon = Icons.Outlined.Check,
-                                        label = "Classify 10",
+                                        icon = if (isBackgroundClassifying) Icons.Outlined.Close else Icons.Outlined.Check,
+                                        label = if (isBackgroundClassifying) "Stop" else "Classify 10",
                                         onClick = {
                                             if (!modelDownload.isReady()) {
                                                 status = "Download the model first."
                                                 return@QuickAction
                                             }
-                                            if (isBatchClassifying) {
-                                                status = "Batch classification is already running."
+                                            if (isBackgroundClassifying) {
+                                                BackgroundClassificationService.stop(this@MainActivity)
+                                                status = "Stopping background classification..."
                                                 return@QuickAction
                                             }
+
+                                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                                val hasNotificationPermission = ContextCompat.checkSelfPermission(
+                                                    this@MainActivity,
+                                                    Manifest.permission.POST_NOTIFICATIONS
+                                                ) == PackageManager.PERMISSION_GRANTED
+                                                if (!hasNotificationPermission) {
+                                                    notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                                                }
+                                            }
+
                                             val pending = screenshots.filter { shot ->
                                                 UriKey(shot.uri.toString()) !in classifications
                                             }.take(10)
@@ -696,50 +848,11 @@ class MainActivity : ComponentActivity() {
                                                 return@QuickAction
                                             }
 
-                                            lifecycleScope.launch {
-                                                val needsInitialization = classifier == null
-                                                isBatchClassifying = true
-                                                batchDone = 0
-                                                batchTotal = pending.size
-                                                batchStartEpochMs = System.currentTimeMillis()
-                                                batchStageMessage = if (needsInitialization) {
-                                                    "Initializing Gemma for first image..."
-                                                } else {
-                                                    "Classification started."
-                                                }
-                                                status = if (needsInitialization) {
-                                                    "Initializing Gemma. First image may take longer."
-                                                } else {
-                                                    "Starting classification for top ${pending.size} uncategorized screenshots..."
-                                                }
-
-                                                var failed = 0
-                                                pending.forEachIndexed { index, shot ->
-                                                    if (!(needsInitialization && index == 0)) {
-                                                        batchStageMessage = "Classification started: image ${index + 1}/$batchTotal"
-                                                    }
-                                                    status = "Classifying ${index + 1}/$batchTotal: ${shot.displayName}"
-                                                    val ok = classifyAndPersist(shot)
-                                                    if (!ok) failed += 1
-                                                    if (needsInitialization && index == 0) {
-                                                        batchStageMessage = "Gemma initialized. Classification started."
-                                                    }
-                                                    batchDone = index + 1
-                                                    if (batchDone < batchTotal) {
-                                                        batchStageMessage = "Classification started: image ${batchDone + 1}/$batchTotal"
-                                                    }
-                                                    delay(75)
-                                                }
-
-                                                isBatchClassifying = false
-                                                batchStartEpochMs = null
-                                                batchStageMessage = null
-                                                status = if (failed == 0) {
-                                                    "Classify 10 complete: $batchDone / $batchTotal succeeded."
-                                                } else {
-                                                    "Classify 10 complete: ${batchTotal - failed} succeeded, $failed failed."
-                                                }
-                                            }
+                                            BackgroundClassificationService.start(
+                                                context = this@MainActivity,
+                                                limit = 10
+                                            )
+                                            status = "Background Classify 10 started. You can leave app; progress and avg time are in notification."
                                         }
                                     )
                                     QuickAction(
@@ -753,7 +866,23 @@ class MainActivity : ComponentActivity() {
                                         icon = Icons.Outlined.PhotoLibrary,
                                         label = "Phone",
                                         onClick = {
-                                            phoneGalleryPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+                                            if (ContextCompat.checkSelfPermission(
+                                                    this@MainActivity,
+                                                    Manifest.permission.READ_MEDIA_IMAGES
+                                                ) != PackageManager.PERMISSION_GRANTED
+                                            ) {
+                                                permissionLauncher.launch(Manifest.permission.READ_MEDIA_IMAGES)
+                                                return@QuickAction
+                                            }
+                                            showPhoneScreenshotPicker = true
+                                            isPhoneScreenshotPickerLoading = true
+                                            lifecycleScope.launch {
+                                                val screenshotOnly = withContext(Dispatchers.IO) {
+                                                    ScreenshotMedia(this@MainActivity).loadRecentScreenshots(maxCount = 400)
+                                                }.distinctBy { it.uri.toString() }
+                                                phoneScreenshotPickerItems = screenshotOnly
+                                                isPhoneScreenshotPickerLoading = false
+                                            }
                                         }
                                     )
                                     QuickAction(
@@ -782,6 +911,17 @@ class MainActivity : ComponentActivity() {
                                                     isScreenshotSectionLoading = false
                                                 }
                                             }
+                                        }
+                                    )
+                                    QuickAction(
+                                        icon = Icons.Outlined.Delete,
+                                        label = "Delete",
+                                        onClick = {
+                                            if (isBackgroundClassifying) {
+                                                status = "Stop background classification before deleting classifications."
+                                                return@QuickAction
+                                            }
+                                            showDeleteAllClassificationsDialog = true
                                         }
                                     )
                                 }
@@ -998,6 +1138,113 @@ class MainActivity : ComponentActivity() {
                             onDismiss = { selectedImageProfile = null }
                         )
                     }
+
+                    if (showDeleteAllClassificationsDialog) {
+                        AlertDialog(
+                            onDismissRequest = { showDeleteAllClassificationsDialog = false },
+                            title = { Text("Delete all classifications?") },
+                            text = {
+                                Text(
+                                    "This will remove all classification entries from local JSON and reset categorized results. Images remain on your phone."
+                                )
+                            },
+                            confirmButton = {
+                                TextButton(onClick = {
+                                    classifications = emptyMap()
+                                    selectedImageProfile = null
+                                    lifecycleScope.launch(Dispatchers.IO) {
+                                        saveClassificationsToDisk(emptyList())
+                                    }
+                                    showDeleteAllClassificationsDialog = false
+                                    status = "All classifications deleted. You can start classifying from scratch."
+                                }) {
+                                    Text("Delete all")
+                                }
+                            },
+                            dismissButton = {
+                                TextButton(onClick = { showDeleteAllClassificationsDialog = false }) {
+                                    Text("Cancel")
+                                }
+                            }
+                        )
+                    }
+
+                    if (showPhoneScreenshotPicker) {
+                        AlertDialog(
+                            onDismissRequest = { showPhoneScreenshotPicker = false },
+                            title = { Text("Pick from Screenshots") },
+                            text = {
+                                if (isPhoneScreenshotPickerLoading) {
+                                    Column(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalAlignment = Alignment.CenterHorizontally,
+                                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                                    ) {
+                                        CircularProgressIndicator()
+                                        Text("Loading screenshots...")
+                                    }
+                                } else {
+                                    if (phoneScreenshotPickerItems.isEmpty()) {
+                                        Text("No screenshots found in your Screenshots folder.")
+                                    } else {
+                                        LazyColumn(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .height(360.dp),
+                                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                                        ) {
+                                            items(phoneScreenshotPickerItems.take(200)) { shot ->
+                                                Row(
+                                                    modifier = Modifier
+                                                        .fillMaxWidth()
+                                                        .clip(androidx.compose.foundation.shape.RoundedCornerShape(10.dp))
+                                                        .clickable {
+                                                            selectedGalleryImage = shot
+                                                            screenshots = listOf(shot) + screenshots.filterNot { it.uri == shot.uri }
+                                                            showPhoneScreenshotPicker = false
+                                                            status = "Screenshot selected from Screenshots folder."
+                                                        }
+                                                        .padding(8.dp),
+                                                    verticalAlignment = Alignment.CenterVertically,
+                                                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                                                ) {
+                                                    AsyncImage(
+                                                        model = shot.uri,
+                                                        contentDescription = shot.displayName,
+                                                        contentScale = ContentScale.Crop,
+                                                        modifier = Modifier
+                                                            .size(56.dp)
+                                                            .clip(androidx.compose.foundation.shape.RoundedCornerShape(8.dp))
+                                                    )
+                                                    Column {
+                                                        Text(
+                                                            text = shot.displayName,
+                                                            maxLines = 1,
+                                                            overflow = TextOverflow.Ellipsis,
+                                                            fontWeight = FontWeight.Medium,
+                                                            color = Color(0xFF102A43)
+                                                        )
+                                                        Text(
+                                                            text = shot.relativePath.orEmpty(),
+                                                            maxLines = 1,
+                                                            overflow = TextOverflow.Ellipsis,
+                                                            style = MaterialTheme.typography.bodySmall,
+                                                            color = Color(0xFF4A6572)
+                                                        )
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            },
+                            confirmButton = {
+                                TextButton(onClick = { showPhoneScreenshotPicker = false }) {
+                                    Text("Close")
+                                }
+                            }
+                        )
+                    }
                 }
             }
         }
@@ -1008,14 +1255,35 @@ class MainActivity : ComponentActivity() {
             onLoaded(withContext(Dispatchers.IO) { ScreenshotMedia(this@MainActivity).loadRecentScreenshots() })
         }
     }
+
+    private fun openAppPermissionSettings() {
+        val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+            data = Uri.fromParts("package", packageName, null)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        startActivity(intent)
+    }
+
+    private fun openNotificationSettings() {
+        val intent = Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).apply {
+            putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        runCatching { startActivity(intent) }
+            .onFailure { openAppPermissionSettings() }
+    }
 }
 
 private const val CATEGORY_PREFERENCES_KEY = "categories"
 private const val CATEGORY_DEFAULTS_VERSION_KEY = "category_defaults_version"
 private const val CUSTOM_PROMPT_PREFERENCES_KEY = "custom_prompt"
+private const val VISION_MODE_PREFERENCES_KEY = "vision_mode"
 private const val CLASSIFICATION_STORE_FILE_NAME = "classification_index.json"
-private const val CATEGORY_DEFAULTS_VERSION = 1
+private const val CATEGORY_DEFAULTS_VERSION = 3
 private const val IDENTITY_CARDS_CATEGORY = "Identity cards"
+private const val MOVIE_CATEGORY = "Movie"
+private const val TICKETS_CATEGORY = "Tickets/Bookings"
+private const val OTP_CATEGORY = "OTP/Verification Codes"
 
 private data class ClassifiedImage(
     val imageId: String,
@@ -1036,6 +1304,9 @@ private val DEFAULT_CATEGORIES = listOf(
     "LinkedIn",
     "Quotes/Learning",
     "Food",
+    MOVIE_CATEGORY,
+    TICKETS_CATEGORY,
+    OTP_CATEGORY,
     "Payment/Finance/Bills",
     IDENTITY_CARDS_CATEGORY,
     "QR",
@@ -1059,70 +1330,129 @@ private fun normalizeCategories(categories: List<String>): List<String> =
 @Composable
 private fun PromptSettings(
     customPrompt: String,
+    visionMode: VisionMode,
     promptPreview: String,
     onBack: () -> Unit,
     onCustomPromptChange: (String) -> Unit,
+    onVisionModeChange: (VisionMode) -> Unit,
     onSave: () -> Unit,
     onReset: () -> Unit
 ) {
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        IconButton(onClick = onBack) {
-            Icon(Icons.AutoMirrored.Outlined.ArrowBack, contentDescription = "Back")
-        }
-        Text("Prompt settings", style = MaterialTheme.typography.titleLarge)
-        IconButton(onClick = onReset) {
-            Icon(Icons.Outlined.Refresh, contentDescription = "Reset prompt")
-        }
-    }
-    Text("Edit the extra prompt that Gemma applies during classification.")
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = androidx.compose.foundation.shape.RoundedCornerShape(8.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
-    ) {
-        Column(
-            modifier = Modifier.padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp)
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
         ) {
-            Text("Custom prompt", style = MaterialTheme.typography.titleMedium)
-            Text("This is used as-is during classification. Keep it short and specific.")
-            OutlinedTextField(
-                value = customPrompt,
-                onValueChange = onCustomPromptChange,
-                modifier = Modifier.fillMaxWidth(),
-                label = { Text("Instructions for Gemma") },
-                placeholder = { Text("For example: prioritize food over quotes") },
-                minLines = 3
-            )
+            IconButton(onClick = onBack) {
+                Icon(Icons.AutoMirrored.Outlined.ArrowBack, contentDescription = "Back")
+            }
+            Text("Prompt settings", style = MaterialTheme.typography.titleLarge)
+            IconButton(onClick = onReset) {
+                Icon(Icons.Outlined.Refresh, contentDescription = "Reset prompt")
+            }
         }
-    }
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = androidx.compose.foundation.shape.RoundedCornerShape(8.dp),
-        colors = CardDefaults.cardColors(containerColor = Color(0xFFF4F7FB))
-    ) {
-        Column(
-            modifier = Modifier.padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp)
+
+        Text("Edit the extra prompt that Gemma applies during classification.")
+
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            shape = androidx.compose.foundation.shape.RoundedCornerShape(8.dp),
+            colors = CardDefaults.cardColors(containerColor = Color(0xFFEAF3F3))
         ) {
-            Text("Prompt currently used by app", style = MaterialTheme.typography.titleMedium)
-            Text("This is the exact full prompt template used during classification.")
-            OutlinedTextField(
-                value = promptPreview,
-                onValueChange = {},
-                readOnly = true,
-                modifier = Modifier.fillMaxWidth(),
-                minLines = 8,
-                maxLines = 14
-            )
+            Column(
+                modifier = Modifier.padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Text(
+                    "Vision & image settings",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = Color(0xFF102A43),
+                    fontWeight = FontWeight.SemiBold
+                )
+                Text(
+                    "Choose speed/quality for image understanding. This also changes internal image resize.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color(0xFF4A6572)
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    VisionMode.entries.forEach { mode ->
+                        val selected = mode == visionMode
+                        Surface(
+                            color = if (selected) Color(0xFF2F6E6A) else Color(0xFFDCE9E8),
+                            shape = androidx.compose.foundation.shape.RoundedCornerShape(14.dp),
+                            modifier = Modifier.clickable { onVisionModeChange(mode) }
+                        ) {
+                            Text(
+                                text = mode.label,
+                                color = if (selected) Color.White else Color(0xFF1E4F4B),
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                                style = MaterialTheme.typography.labelLarge,
+                                fontWeight = FontWeight.Medium
+                            )
+                        }
+                    }
+                }
+                Text(
+                    "Current: ${visionMode.label} | Token budget ${visionMode.visualTokenBudget} | Resize ${visionMode.maxImageLongSide}px",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color(0xFF355C7D)
+                )
+            }
         }
-    }
-    Button(onClick = onSave) {
-        Text("Save prompt")
+
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            shape = androidx.compose.foundation.shape.RoundedCornerShape(8.dp),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+        ) {
+            Column(
+                modifier = Modifier.padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                Text("Custom prompt", style = MaterialTheme.typography.titleMedium)
+                Text("This is used as-is during classification. Keep it short and specific.")
+                OutlinedTextField(
+                    value = customPrompt,
+                    onValueChange = onCustomPromptChange,
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("Instructions for Gemma") },
+                    placeholder = { Text("For example: prioritize food over quotes") },
+                    minLines = 3
+                )
+            }
+        }
+
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            shape = androidx.compose.foundation.shape.RoundedCornerShape(8.dp),
+            colors = CardDefaults.cardColors(containerColor = Color(0xFFF4F7FB))
+        ) {
+            Column(
+                modifier = Modifier.padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                Text("Prompt currently used by app", style = MaterialTheme.typography.titleMedium)
+                Text("This is the exact full prompt template used during classification.")
+                OutlinedTextField(
+                    value = promptPreview,
+                    onValueChange = {},
+                    readOnly = true,
+                    modifier = Modifier.fillMaxWidth(),
+                    minLines = 8,
+                    maxLines = 14
+                )
+            }
+        }
+
+        Button(onClick = onSave) {
+            Text("Save prompt + settings")
+        }
     }
 }
 
@@ -1960,24 +2290,42 @@ private fun buildPromptPreview(categories: List<String>, customPrompt: String): 
                 "when they are the main content."
         )
     }
+    categories.findCategoryName("Movie")?.let { movieCategory ->
+        appendLine(
+            "9. Choose $movieCategory when the screenshot shows movie titles, movie suggestions, " +
+                "film posters, trailer pages, OTT movie lists, or movie recommendation content."
+        )
+    }
+    categories.findCategoryName("Tickets/Bookings")?.let { ticketsCategory ->
+        appendLine(
+            "10. Choose $ticketsCategory for railway, flight, bus, movie, or hotel tickets, " +
+                "boarding passes, booking confirmations, or reservation details."
+        )
+    }
+    categories.findCategoryName("OTP/Verification Codes")?.let { otpCategory ->
+        appendLine(
+            "11. Choose $otpCategory when the primary content is an OTP, one-time code, login code, " +
+                "or SMS/email verification message."
+        )
+    }
     categories.findCategoryName("Comment Section (YouTube / Instagram)")?.let { commentsCategory ->
         appendLine(
-            "9. Choose $commentsCategory only when an actual comment thread is visible, such as multiple " +
+            "12. Choose $commentsCategory only when an actual comment thread is visible, such as multiple " +
                 "comments or replies with user names, avatars, timestamps, likes, or reply controls. Do not " +
                 "choose it for a standalone quote, caption, post, or image just because it came from YouTube or Instagram."
         )
     }
     categories.findCategoryName("Greeting Messages (Good morning etc)")?.let { greetingCategory ->
-        appendLine("10. Choose $greetingCategory when greeting, blessing, festival, or good-morning text is the main content.")
+        appendLine("13. Choose $greetingCategory when greeting, blessing, festival, or good-morning text is the main content.")
     }
     categories.findCategoryName("Nature/Plants")?.let { natureCategory ->
-        appendLine("11. Choose $natureCategory only when nature is the primary subject and no person is present.")
+        appendLine("14. Choose $natureCategory only when nature is the primary subject and no person is present.")
     }
-    appendLine("12. Custom instructions below override these baseline rules when they conflict.")
+    appendLine("15. Custom instructions below override these baseline rules when they conflict.")
     appendLine()
     appendLine("Custom instructions: ${customPrompt.trim().ifBlank { "None" }}")
     appendLine()
-    appendLine("13. Also provide a very short plain-language description of the screenshot in at most 12 words.")
+    appendLine("16. Also provide a very short plain-language description of the screenshot in at most 12 words.")
     append("Return JSON only, with no explanation: {\"category\":\"${categories.firstOrNull() ?: "Others"}\",\"confidence\":0.0,\"description\":\"brief summary\"}")
 }
 
@@ -1989,6 +2337,9 @@ private fun promptCategoryDefinition(category: String): String = when (category.
     "linkedin" -> "LinkedIn posts, profiles, jobs, professional updates, or workplace content."
     "quotes/learning" -> "Quotes, study material, educational notes, tutorials, or useful explanations."
     "food" -> "Meals, recipes, restaurant menus, cooking, or food and drink products."
+    "movie" -> "Movie titles, film recommendations, cinema suggestions, OTT watchlists, reviews, trailers, or movie posters."
+    "tickets/bookings" -> "Railway, flight, bus, movie, or hotel tickets, boarding passes, booking confirmations, and reservation details."
+    "otp/verification codes" -> "OTP or one-time password messages, login verification codes, authentication SMS, and temporary security codes."
     "payment/finance/bills" -> "Payments, banking, invoices, bills, balances, transactions, or financial notices."
     "identity cards" -> "Official identity documents such as Aadhaar cards, PAN cards, voter IDs, passports, driving licences, or similar IDs."
     "qr" -> "A QR code intended to be scanned."

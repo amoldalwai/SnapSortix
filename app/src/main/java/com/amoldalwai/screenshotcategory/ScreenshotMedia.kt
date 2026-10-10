@@ -30,6 +30,7 @@ class ScreenshotMedia(private val context: Context) {
         val pageSize = 500
 
         return buildList {
+            val seenUris = HashSet<String>()
             var offset = 0
             var keepLoading = true
 
@@ -43,7 +44,10 @@ class ScreenshotMedia(private val context: Context) {
                     putStringArray(ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS, selectionArgs)
                     putStringArray(
                         ContentResolver.QUERY_ARG_SORT_COLUMNS,
-                        arrayOf(MediaStore.Images.Media.DATE_ADDED)
+                        arrayOf(
+                            MediaStore.Images.Media.DATE_ADDED,
+                            MediaStore.Images.Media._ID
+                        )
                     )
                     putInt(
                         ContentResolver.QUERY_ARG_SORT_DIRECTION,
@@ -61,10 +65,16 @@ class ScreenshotMedia(private val context: Context) {
                         val pathIndex = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.RELATIVE_PATH)
                         while (cursor.moveToNext()) {
                             fetchedInPage += 1
+                            val imageId = cursor.getLong(idIndex)
+                            val imageUri = ContentUris.withAppendedId(collection, imageId)
+                            val uriKey = imageUri.toString()
+                            if (!seenUris.add(uriKey)) {
+                                continue
+                            }
                             add(
                                 Screenshot(
-                                    imageId = cursor.getLong(idIndex).toString(),
-                                    uri = ContentUris.withAppendedId(collection, cursor.getLong(idIndex)),
+                                    imageId = imageId.toString(),
+                                    uri = imageUri,
                                     displayName = cursor.getString(nameIndex),
                                     relativePath = cursor.getString(pathIndex)
                                 )
