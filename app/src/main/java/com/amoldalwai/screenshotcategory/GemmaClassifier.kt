@@ -135,6 +135,7 @@ class GemmaClassifier(private val context: Context, private val modelFile: File)
         appendLine("Custom instructions: ${customPrompt.trim().ifBlank { "None" }}")
         appendLine()
         appendLine("13. Also provide a very short plain-language description of the screenshot in at most 12 words.")
+        appendLine("14. Ensure category and description are semantically consistent. Use Others only when no listed category matches the described content.")
         append("Return JSON only, with no explanation: {\"category\":\"${categories.first()}\",\"confidence\":0.0,\"description\":\"brief summary\"}")
     }
 
@@ -239,25 +240,85 @@ data class Classification(
 
         fun fromModelResponse(response: String, allowedCategories: List<String>): Classification {
             val requestedCategory = categoryPattern.find(response)?.groupValues?.get(1)
+            val description = descriptionPattern.find(response)?.groupValues?.get(1)?.trim().orEmpty()
             val normalizedRequested = normalizeCategoryKey(requestedCategory)
+            val category = resolveCategory(normalizedRequested, description, allowedCategories)
+                ?: allowedCategories.last()
+            val confidence = confidencePattern.find(response)?.groupValues?.get(1)?.toFloatOrNull() ?: 0f
+            return Classification(category, confidence.coerceIn(0f, 1f), description)
+        }
+
+        private fun resolveCategory(
+            normalizedRequested: String,
+            description: String,
+            allowedCategories: List<String>
+        ): String? {
+            val normalizedAllowed = allowedCategories.associateBy { normalizeCategoryKey(it) }
+            normalizedAllowed[normalizedRequested]?.let { return it }
+
+            val compactRequested = normalizedRequested.replace(" ", "")
+            if (compactRequested.isNotEmpty()) {
+                allowedCategories.firstOrNull {
+                    normalizeCategoryKey(it).replace(" ", "") == compactRequested
+                }?.let { return it }
+            }
+
             val peopleCategory = allowedCategories.firstOrNull {
                 normalizeCategoryKey(it) == "only people no text"
             }
-            val category = allowedCategories.firstOrNull {
-                normalizeCategoryKey(it) == normalizedRequested
-            } ?: when {
-                peopleCategory != null && normalizedRequested in setOf(
+            if (peopleCategory != null && normalizedRequested in setOf(
                     "people",
                     "person",
                     "only people",
                     "people no text",
                     "person no text"
-                ) -> peopleCategory
-                else -> allowedCategories.last()
+                )
+            ) {
+                return peopleCategory
             }
-            val confidence = confidencePattern.find(response)?.groupValues?.get(1)?.toFloatOrNull() ?: 0f
-            val description = descriptionPattern.find(response)?.groupValues?.get(1)?.trim().orEmpty()
-            return Classification(category, confidence.coerceIn(0f, 1f), description)
+
+            inferCategoryByKeywords(normalizedRequested, allowedCategories)?.let { return it }
+
+            val requestedIsOthers = normalizedRequested == "others" || normalizedRequested == "other"
+            if (requestedIsOthers) {
+                inferCategoryByKeywords(normalizeCategoryKey(description), allowedCategories)?.let { return it }
+            }
+
+            return null
+        }
+
+        private fun inferCategoryByKeywords(text: String, allowedCategories: List<String>): String? {
+            if (text.isBlank()) return null
+
+            val conceptHints = listOf(
+                listOf("quotes learning", "quote", "learning", "study", "tutorial", "lesson", "educational", "motivation"),
+                listOf("payment finance bills", "payment", "bank", "invoice", "bill", "transaction", "upi", "balance"),
+                listOf("comment section youtube instagram", "comment", "comments", "reply", "thread", "replies"),
+                listOf("greeting messages good morning", "good morning", "good night", "greetings", "festival"),
+                listOf("identity cards", "aadhaar", "pan", "passport", "driving licence", "driving license", "id card"),
+                listOf("maps", "map", "navigation", "route", "directions", "location"),
+                listOf("qr", "qr code", "barcode", "scan code"),
+                listOf("only people no text", "person", "people", "selfie", "portrait"),
+                listOf("food", "meal", "recipe", "restaurant", "dish", "drink"),
+                listOf("animals", "animal", "pet", "dog", "cat", "bird"),
+                listOf("nature plants", "plant", "tree", "flower", "landscape", "nature"),
+                listOf("games bgmi", "game", "gaming", "bgmi", "score", "gameplay"),
+                listOf("linkedin", "linkedin", "job", "workplace", "professional")
+            )
+
+            for (hints in conceptHints) {
+                if (hints.drop(1).any { text.contains(it) }) {
+                    val targetCategory = allowedCategories.firstOrNull { allowed ->
+                        val normalizedAllowed = normalizeCategoryKey(allowed)
+                        hints.any { hint ->
+                            normalizedAllowed.contains(hint) || hint.contains(normalizedAllowed)
+                        }
+                    }
+                    if (targetCategory != null) return targetCategory
+                }
+            }
+
+            return null
         }
 
         private fun normalizeCategoryKey(value: String?): String = value
@@ -265,7 +326,11 @@ data class Classification(
             .trim()
             .trim('"', '\'', '.', ',', ';', ':', '!', '?', '(', ')', '[', ']', '{', '}')
             .replace("&", " and ")
+            .replace("/", " ")
+            .replace("-", " ")
+            .replace(Regex("""[^a-zA-Z0-9\s]"""), " ")
             .replace(Regex("""\s+"""), " ")
+            .trim()
             .lowercase()
     }
 }

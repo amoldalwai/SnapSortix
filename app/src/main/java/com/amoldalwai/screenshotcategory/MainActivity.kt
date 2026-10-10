@@ -1,6 +1,7 @@
 package com.amoldalwai.screenshotcategory
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.provider.MediaStore
 import android.net.Uri
@@ -36,9 +37,12 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.outlined.Add
+import androidx.compose.material.icons.outlined.AutoAwesome
 import androidx.compose.material.icons.outlined.Check
 import androidx.compose.material.icons.outlined.Close
+import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.PhotoLibrary
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Search
@@ -48,6 +52,11 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ExposedDropdownMenuBox
+import androidx.compose.material3.ExposedDropdownMenuDefaults
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Icon
@@ -74,6 +83,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.Dialog
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import coil.compose.AsyncImage
@@ -186,7 +196,7 @@ class MainActivity : ComponentActivity() {
 
     private fun uriStillExists(uriValue: String): Boolean = runCatching {
         val uri = Uri.parse(uriValue)
-        contentResolver.query(
+        val foundByQuery = contentResolver.query(
             uri,
             arrayOf(MediaStore.MediaColumns._ID),
             null,
@@ -195,6 +205,18 @@ class MainActivity : ComponentActivity() {
         )?.use { cursor ->
             cursor.moveToFirst()
         } ?: false
+
+        if (foundByQuery) {
+            true
+        } else {
+            // Some picker/document URIs are readable but may not expose MediaStore columns.
+            contentResolver.openInputStream(uri)?.use { true } ?: false
+        }
+    }.getOrElse { false }
+
+    private fun persistGalleryUriPermission(uri: Uri): Boolean = runCatching {
+        contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        true
     }.getOrElse { false }
 
     private fun pruneMissingClassifications(
@@ -236,6 +258,7 @@ class MainActivity : ComponentActivity() {
         var showSettings by remember { mutableStateOf(false) }
         var showDiscardChanges by remember { mutableStateOf(false) }
         var activeClassification by remember { mutableStateOf<UriKey?>(null) }
+        var activeReclassification by remember { mutableStateOf<UriKey?>(null) }
         var isModelPreparing by remember { mutableStateOf(false) }
         var isBatchClassifying by remember { mutableStateOf(false) }
         var batchDone by remember { mutableStateOf(0) }
@@ -245,6 +268,7 @@ class MainActivity : ComponentActivity() {
         var searchQuery by remember { mutableStateOf("") }
         var isSearchResultsLoading by remember { mutableStateOf(false) }
         var selectedCategory by remember { mutableStateOf<String?>(null) }
+        var showAllCategories by remember { mutableStateOf(false) }
         var showAllGallery by remember { mutableStateOf(false) }
         var selectedGalleryImage by remember { mutableStateOf<Screenshot?>(null) }
         var isCategorySectionLoading by remember { mutableStateOf(true) }
@@ -283,9 +307,10 @@ class MainActivity : ComponentActivity() {
             }
         }
         val galleryPicker = rememberLauncherForActivityResult(
-            ActivityResultContracts.PickVisualMedia()
+            ActivityResultContracts.OpenDocument()
         ) { selectedUri ->
             if (selectedUri != null) {
+                val permissionPersisted = persistGalleryUriPermission(selectedUri)
                 val selectedImage = Screenshot(
                     imageId = selectedUri.lastPathSegment ?: selectedUri.toString(),
                     uri = selectedUri,
@@ -294,7 +319,31 @@ class MainActivity : ComponentActivity() {
                 )
                 selectedGalleryImage = selectedImage
                 screenshots = listOf(selectedImage) + screenshots.filterNot { it.uri == selectedUri }
-                status = "Gallery image added."
+                status = if (permissionPersisted) {
+                    "Gallery image added. It will remain available after app restart."
+                } else {
+                    "Gallery image added. If this URI is temporary, it may not persist after restart."
+                }
+            }
+        }
+        val phoneGalleryPicker = rememberLauncherForActivityResult(
+            ActivityResultContracts.PickVisualMedia()
+        ) { selectedUri ->
+            if (selectedUri != null) {
+                val permissionPersisted = persistGalleryUriPermission(selectedUri)
+                val selectedImage = Screenshot(
+                    imageId = selectedUri.lastPathSegment ?: selectedUri.toString(),
+                    uri = selectedUri,
+                    displayName = "Selected phone gallery image",
+                    relativePath = "Phone Gallery"
+                )
+                selectedGalleryImage = selectedImage
+                screenshots = listOf(selectedImage) + screenshots.filterNot { it.uri == selectedUri }
+                status = if (permissionPersisted) {
+                    "Phone gallery image added. It will remain available after app restart."
+                } else {
+                    "Phone gallery image added. If persistence fails for this picker, use Gallery for guaranteed restart-safe selection."
+                }
             }
         }
 
@@ -697,9 +746,42 @@ class MainActivity : ComponentActivity() {
                                         icon = Icons.Outlined.PhotoLibrary,
                                         label = "Gallery",
                                         onClick = {
-                                            galleryPicker.launch(
-                                                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
-                                            )
+                                            galleryPicker.launch(arrayOf("image/*"))
+                                        }
+                                    )
+                                    QuickAction(
+                                        icon = Icons.Outlined.PhotoLibrary,
+                                        label = "Phone",
+                                        onClick = {
+                                            phoneGalleryPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+                                        }
+                                    )
+                                    QuickAction(
+                                        icon = Icons.Outlined.Refresh,
+                                        label = "Sync",
+                                        onClick = {
+                                            if (ContextCompat.checkSelfPermission(
+                                                    this@MainActivity,
+                                                    Manifest.permission.READ_MEDIA_IMAGES
+                                                ) != PackageManager.PERMISSION_GRANTED
+                                            ) {
+                                                permissionLauncher.launch(Manifest.permission.READ_MEDIA_IMAGES)
+                                                return@QuickAction
+                                            }
+                                            isCategorySectionLoading = true
+                                            isScreenshotSectionLoading = true
+                                            lifecycleScope.launch {
+                                                val cleaned = withContext(Dispatchers.IO) {
+                                                    pruneMissingClassifications(classifications)
+                                                }
+                                                classifications = cleaned
+                                                loadScreenshots { loadedScreenshots ->
+                                                    screenshots = mergeScreenshotsWithPersisted(loadedScreenshots, cleaned)
+                                                    status = "Synced ${loadedScreenshots.size} screenshots from your phone gallery."
+                                                    isCategorySectionLoading = false
+                                                    isScreenshotSectionLoading = false
+                                                }
+                                            }
                                         }
                                     )
                                 }
@@ -713,16 +795,24 @@ class MainActivity : ComponentActivity() {
                                         selectedCategory = selectedCategory,
                                         onCategoryClick = { category ->
                                             selectedCategory = category
+                                            showAllCategories = false
                                             showAllGallery = false
                                             selectedImageProfile = null
                                             status = "Viewing $category photos."
                                         },
                                         onViewAllClick = {
+                                            val nextShowAllCategories = !showAllCategories
+                                            showAllCategories = nextShowAllCategories
                                             selectedCategory = null
-                                            showAllGallery = true
+                                            showAllGallery = false
                                             selectedImageProfile = null
-                                            status = "Showing gallery across all categories."
-                                        }
+                                            status = if (nextShowAllCategories) {
+                                                "Showing all categories."
+                                            } else {
+                                                "Showing top categories."
+                                            }
+                                        },
+                                        showAllCategories = showAllCategories
                                     )
                                 }
                             }
@@ -781,6 +871,33 @@ class MainActivity : ComponentActivity() {
                                             classification = classifications[UriKey(galleryImage.uri.toString())]?.toClassification(),
                                             enabled = modelDownload.isReady() && activeClassification == null && !isModelPreparing && !isBatchClassifying,
                                             isClassifying = activeClassification == UriKey(galleryImage.uri.toString()),
+                                            isReclassifying = activeReclassification == UriKey(galleryImage.uri.toString()),
+                                            onEditClick = {
+                                                val details = classifications[UriKey(galleryImage.uri.toString())]
+                                                if (details != null) {
+                                                    selectedImageProfile = galleryImage to details
+                                                } else {
+                                                    status = "Classify this image first, then you can edit category and description."
+                                                }
+                                            },
+                                            onReclassifyClick = {
+                                                lifecycleScope.launch {
+                                                    val imageKey = UriKey(galleryImage.uri.toString())
+                                                    activeReclassification = imageKey
+                                                    status = if (classifier == null) {
+                                                        "Preparing Gemma for re-classification."
+                                                    } else {
+                                                        "Re-classifying ${galleryImage.displayName} with latest prompt..."
+                                                    }
+                                                    val savedToDisk = classifyAndPersist(galleryImage)
+                                                    activeReclassification = null
+                                                    status = if (savedToDisk) {
+                                                        "Re-classification finished. Category has been updated."
+                                                    } else {
+                                                        "Re-classification failed or could not be saved."
+                                                    }
+                                                }
+                                            },
                                             onClassify = {
                                                 lifecycleScope.launch {
                                                     status = if (classifier == null) {
@@ -837,6 +954,47 @@ class MainActivity : ComponentActivity() {
                         ImageProfileDialog(
                             screenshot = screenshot,
                             details = details,
+                            categories = savedCategories,
+                            isReclassifying = activeReclassification == UriKey(screenshot.uri.toString()),
+                            onSaveEdits = { updatedCategory, updatedDescription ->
+                                val imageKey = UriKey(screenshot.uri.toString())
+                                val existing = classifications[imageKey] ?: return@ImageProfileDialog false
+                                val updatedEntry = existing.copy(
+                                    category = updatedCategory,
+                                    description = updatedDescription.trim(),
+                                    updatedAt = System.currentTimeMillis()
+                                )
+                                val updatedMap = classifications + (imageKey to updatedEntry)
+                                classifications = updatedMap
+                                lifecycleScope.launch(Dispatchers.IO) {
+                                    saveClassificationsToDisk(updatedMap.values)
+                                }
+                                status = "Updated classification for ${screenshot.displayName}."
+                                selectedImageProfile = screenshot to updatedEntry
+                                true
+                            },
+                            onReclassify = {
+                                lifecycleScope.launch {
+                                    val imageKey = UriKey(screenshot.uri.toString())
+                                    activeReclassification = imageKey
+                                    status = if (classifier == null) {
+                                        "Preparing Gemma for re-classification."
+                                    } else {
+                                        "Re-classifying ${screenshot.displayName} with latest prompt..."
+                                    }
+                                    val savedToDisk = classifyAndPersist(screenshot)
+                                    activeReclassification = null
+                                    if (savedToDisk) {
+                                        val latest = classifications[UriKey(screenshot.uri.toString())]
+                                        if (latest != null) {
+                                            selectedImageProfile = screenshot to latest
+                                        }
+                                        status = "Re-classification finished. Category has been updated."
+                                    } else {
+                                        status = "Re-classification failed or could not be saved."
+                                    }
+                                }
+                            },
                             onDismiss = { selectedImageProfile = null }
                         )
                     }
@@ -1047,6 +1205,9 @@ private fun ScreenshotRow(
     classification: Classification?,
     enabled: Boolean,
     isClassifying: Boolean,
+    isReclassifying: Boolean = false,
+    onEditClick: (() -> Unit)? = null,
+    onReclassifyClick: (() -> Unit)? = null,
     onClassify: () -> Unit
 ) {
     Card(
@@ -1107,6 +1268,12 @@ private fun ScreenshotRow(
                         color = Color(0xFF2E9B58),
                         trackColor = Color(0xFFCEE9D7)
                     )
+                    Text(
+                        if (isReclassifying) "Reclassifying with latest prompt..." else "Classifying...",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color(0xFF2E9B58),
+                        fontWeight = FontWeight.Medium
+                    )
                 }
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Surface(
@@ -1122,11 +1289,43 @@ private fun ScreenshotRow(
                         }
                     }
                     Text(
-                        if (isClassifying) "Classifying..." else "Classify",
+                        if (isClassifying) {
+                            if (isReclassifying) "Reclassifying..." else "Classifying..."
+                        } else {
+                            "Classify"
+                        },
                         style = MaterialTheme.typography.labelLarge,
                         fontWeight = FontWeight.Medium,
                         color = Color(0xFF2F6E6A)
                     )
+                    if (classification != null && onEditClick != null) {
+                        Surface(
+                            color = Color(0xFFF1F5F9),
+                            shape = androidx.compose.foundation.shape.RoundedCornerShape(14.dp)
+                        ) {
+                            IconButton(onClick = onEditClick) {
+                                Icon(
+                                    imageVector = Icons.Outlined.Edit,
+                                    contentDescription = "Edit category and description",
+                                    tint = Color.Gray
+                                )
+                            }
+                        }
+                    }
+                    if (classification != null && onReclassifyClick != null) {
+                        Surface(
+                            color = Color(0xFFF1F5F9),
+                            shape = androidx.compose.foundation.shape.RoundedCornerShape(14.dp)
+                        ) {
+                            IconButton(enabled = enabled && !isClassifying, onClick = onReclassifyClick) {
+                                Icon(
+                                    imageVector = Icons.Outlined.AutoAwesome,
+                                    contentDescription = "Reclassify with latest prompt",
+                                    tint = Color(0xFF5E6C84)
+                                )
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1190,11 +1389,13 @@ private fun CategoryCollectionGrid(
     groupedCollections: Map<String, List<Pair<Screenshot, ClassifiedImage>>>,
     selectedCategory: String?,
     onCategoryClick: (String) -> Unit,
-    onViewAllClick: () -> Unit
+    onViewAllClick: () -> Unit,
+    showAllCategories: Boolean
 ) {
     val sortedCollections = groupedCollections.entries
         .sortedWith(compareByDescending<Map.Entry<String, List<Pair<Screenshot, ClassifiedImage>>>> { it.value.size }
             .thenBy { it.key })
+    val visibleCollections = if (showAllCategories) sortedCollections else sortedCollections.take(4)
 
     Row(
         modifier = Modifier.fillMaxWidth(),
@@ -1208,12 +1409,12 @@ private fun CategoryCollectionGrid(
             color = Color(0xFF102A43)
         )
         TextButton(onClick = onViewAllClick) {
-            Text("View All")
+            Text(if (showAllCategories) "Show Less" else "View All")
         }
     }
 
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        sortedCollections.chunked(2).forEach { rowItems ->
+        visibleCollections.chunked(2).forEach { rowItems ->
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(10.dp)
@@ -1332,7 +1533,6 @@ private fun CategoryImageGrid(
                 horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 rowItems.forEach { screenshot ->
-                    val details = classifications[UriKey(screenshot.uri.toString())]
                     Box(
                         modifier = Modifier
                             .weight(1f)
@@ -1355,15 +1555,6 @@ private fun CategoryImageGrid(
                                     )
                                 )
                         )
-                        Text(
-                            text = "${((details?.confidence ?: 0f) * 100).toInt()}%",
-                            color = Color.White,
-                            style = MaterialTheme.typography.labelLarge,
-                            fontWeight = FontWeight.Bold,
-                            modifier = Modifier
-                                .align(Alignment.BottomEnd)
-                                .padding(8.dp)
-                        )
                     }
                 }
                 if (rowItems.size == 1) {
@@ -1374,42 +1565,159 @@ private fun CategoryImageGrid(
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun ImageProfileDialog(
     screenshot: Screenshot,
     details: ClassifiedImage,
+    categories: List<String>,
+    isReclassifying: Boolean,
+    onSaveEdits: (String, String) -> Boolean,
+    onReclassify: () -> Unit,
     onDismiss: () -> Unit
 ) {
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        confirmButton = {
-            TextButton(onClick = onDismiss) { Text("Close") }
-        },
-        title = {
-            Text(
-                text = "Image profile",
-                color = Color(0xFF102A43),
-                fontWeight = FontWeight.SemiBold
-            )
-        },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+    var isEditing by remember { mutableStateOf(false) }
+    var draftCategory by remember(details.category, categories) {
+        mutableStateOf(
+            categories.firstOrNull { it.equals(details.category, ignoreCase = true) }
+                ?: categories.firstOrNull()
+                ?: details.category
+        )
+    }
+    var draftDescription by remember(details.description) { mutableStateOf(details.description) }
+    var showCategoryMenu by remember { mutableStateOf(false) }
+    var showFullImagePreview by remember { mutableStateOf(false) }
+
+    if (showFullImagePreview) {
+        Dialog(onDismissRequest = { showFullImagePreview = false }) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color(0xE6000000))
+                    .clickable { showFullImagePreview = false },
+                contentAlignment = Alignment.Center
+            ) {
                 AsyncImage(
                     model = screenshot.uri,
                     contentDescription = screenshot.displayName,
-                    contentScale = ContentScale.Crop,
+                    contentScale = ContentScale.Fit,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp)
+                )
+            }
+        }
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        confirmButton = {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (isEditing) {
+                    TextButton(onClick = {
+                        isEditing = false
+                        draftCategory = categories.firstOrNull { it.equals(details.category, ignoreCase = true) }
+                            ?: categories.firstOrNull()
+                            ?: details.category
+                        draftDescription = details.description
+                        showCategoryMenu = false
+                    }) {
+                        Text("Cancel")
+                    }
+                    TextButton(onClick = {
+                        val saved = onSaveEdits(draftCategory, draftDescription)
+                        if (saved) {
+                            isEditing = false
+                            showCategoryMenu = false
+                        }
+                    }) {
+                        Text("Save")
+                    }
+                } else {
+                    TextButton(onClick = onDismiss) { Text("Close") }
+                }
+            }
+        },
+        title = {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "Image profile",
+                    color = Color(0xFF102A43),
+                    fontWeight = FontWeight.SemiBold
+                )
+                IconButton(onClick = {
+                    isEditing = !isEditing
+                    showCategoryMenu = false
+                    if (!isEditing) {
+                        draftCategory = categories.firstOrNull { it.equals(details.category, ignoreCase = true) }
+                            ?: categories.firstOrNull()
+                            ?: details.category
+                        draftDescription = details.description
+                    }
+                }) {
+                    Icon(
+                        imageVector = Icons.Outlined.Edit,
+                        contentDescription = "Edit category and description",
+                        tint = Color.Gray
+                    )
+                }
+                IconButton(onClick = {
+                    showCategoryMenu = false
+                    onReclassify()
+                }, enabled = !isReclassifying) {
+                    if (isReclassifying) {
+                        CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                    } else {
+                        Icon(
+                            imageVector = Icons.Outlined.AutoAwesome,
+                            contentDescription = "Reclassify with latest prompt",
+                            tint = Color(0xFF5E6C84)
+                        )
+                    }
+                }
+            }
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (isReclassifying) {
+                    LinearProgressIndicator(
+                        modifier = Modifier.fillMaxWidth(),
+                        color = Color(0xFF2E9B58),
+                        trackColor = Color(0xFFCEE9D7)
+                    )
+                    Text(
+                        text = "Reclassifying this image with latest prompt...",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color(0xFF2E9B58),
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+                AsyncImage(
+                    model = screenshot.uri,
+                    contentDescription = screenshot.displayName,
+                    contentScale = ContentScale.Fit,
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(190.dp)
+                        .clickable { showFullImagePreview = true }
                         .clip(androidx.compose.foundation.shape.RoundedCornerShape(14.dp))
+                )
+                Text(
+                    text = "Tap image to preview full size",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color(0xFF4A6572)
                 )
 
                 Surface(
-                    color = categoryColor(details.category),
+                    color = categoryColor(if (isEditing) draftCategory.trim().ifBlank { details.category } else details.category),
                     shape = androidx.compose.foundation.shape.RoundedCornerShape(14.dp)
                 ) {
                     Text(
-                        text = details.category,
+                        text = if (isEditing) draftCategory.trim().ifBlank { details.category } else details.category,
                         color = Color.White,
                         fontWeight = FontWeight.Medium,
                         modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
@@ -1417,9 +1725,51 @@ private fun ImageProfileDialog(
                 }
 
                 Text("Confidence: ${((details.confidence * 100).toInt())}%")
-                if (details.description.isNotBlank()) {
+
+                if (isEditing) {
+                    ExposedDropdownMenuBox(
+                        expanded = showCategoryMenu,
+                        onExpandedChange = { showCategoryMenu = !showCategoryMenu }
+                    ) {
+                        OutlinedTextField(
+                            value = draftCategory,
+                            onValueChange = {},
+                            modifier = Modifier
+                                .menuAnchor()
+                                .fillMaxWidth(),
+                            label = { Text("Category") },
+                            singleLine = true,
+                            readOnly = true,
+                            trailingIcon = {
+                                ExposedDropdownMenuDefaults.TrailingIcon(expanded = showCategoryMenu)
+                            }
+                        )
+                        ExposedDropdownMenu(
+                            expanded = showCategoryMenu,
+                            onDismissRequest = { showCategoryMenu = false }
+                        ) {
+                            categories.forEach { option ->
+                                DropdownMenuItem(
+                                    text = { Text(option) },
+                                    onClick = {
+                                        draftCategory = option
+                                        showCategoryMenu = false
+                                    }
+                                )
+                            }
+                        }
+                    }
+                    OutlinedTextField(
+                        value = draftDescription,
+                        onValueChange = { draftDescription = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("Description") },
+                        maxLines = 3
+                    )
+                } else if (details.description.isNotBlank()) {
                     Text("Description: ${details.description}")
                 }
+
                 HorizontalDivider(color = Color(0xFFE2E8F0))
                 Text("Image id: ${details.imageId}", style = MaterialTheme.typography.bodySmall)
                 Text("URI: ${details.imageUri}", style = MaterialTheme.typography.bodySmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
