@@ -161,8 +161,8 @@ class BackgroundClassificationService : Service() {
         startForeground(
             NOTIFICATION_ID,
             buildNotification(
-                title = "Auto detect enabled",
-                text = "Monitoring screenshots",
+                title = "Auto detect on",
+                text = "",
                 progressMax = 0,
                 progressValue = 0,
                 indeterminate = false
@@ -182,8 +182,8 @@ class BackgroundClassificationService : Service() {
         }
         startFallbackScanLoop()
         showWatcherForeground(
-            title = "Auto detect enabled",
-            text = "Monitoring screenshots in background",
+            title = "Auto detect on",
+            text = "",
             progressMax = 0,
             progressValue = 0,
             indeterminate = false
@@ -305,8 +305,8 @@ class BackgroundClassificationService : Service() {
             )
         } else if (notifyWhenIdle) {
             showWatcherForeground(
-                title = "Auto detect enabled",
-                text = "Monitoring screenshots in background",
+                title = "Auto detect on",
+                text = "",
                 progressMax = 0,
                 progressValue = 0,
                 indeterminate = false
@@ -572,8 +572,8 @@ class BackgroundClassificationService : Service() {
         queuedCount = queuedScreenshots.size
         if (watcherEnabled) {
             showWatcherForeground(
-                title = "Auto detect enabled",
-                text = "Monitoring screenshots in background",
+                title = "Auto detect on",
+                text = "",
                 progressMax = 0,
                 progressValue = 0,
                 indeterminate = false
@@ -602,8 +602,8 @@ class BackgroundClassificationService : Service() {
     private fun maybeHideWatcherForeground() {
         if (!watcherEnabled || !watcherForegroundVisible) return
         updateNotification(
-            title = "Auto detect enabled",
-            text = "Monitoring screenshots in background",
+            title = "Auto detect on",
+            text = "",
             progressMax = 0,
             progressValue = 0,
             indeterminate = false
@@ -831,25 +831,26 @@ class BackgroundClassificationService : Service() {
             .setSmallIcon(android.R.drawable.stat_notify_sync)
             .setContentTitle(title)
             .setContentText(text)
-            .setStyle(
-                NotificationCompat.BigTextStyle().bigText(
-                    buildString {
-                        appendLine(text)
-                        if (progressDone > 0) {
-                            appendLine("decode/downscale avg: ${averageDecodeMs} ms")
-                            appendLine("model inference avg: ${averageInferenceMs} ms")
-                            appendLine("write/save avg: ${averageSaveMs} ms")
-                        }
-                        appendLine("runtime: $runtimeBackend")
-                        appendLine("mode: $activeVisionMode (budget $activeTokenBudget, resize ${activeResizeLongSidePx}px)")
-                    }
-                )
-            )
             .setContentIntent(launchPendingIntent)
             .setOnlyAlertOnce(false)
             .setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Stop", stopPendingIntent)
+
+        val details = buildString {
+            if (text.isNotBlank()) {
+                appendLine(text)
+            }
+            if (progressDone > 0) {
+                appendLine("decode/downscale avg: ${averageDecodeMs} ms")
+                appendLine("model inference avg: ${averageInferenceMs} ms")
+                appendLine("write/save avg: ${averageSaveMs} ms")
+            }
+        }.trim()
+
+        if (details.isNotBlank()) {
+            builder.setStyle(NotificationCompat.BigTextStyle().bigText(details))
+        }
 
         if (indeterminate || progressMax > 0) {
             val safeMax = progressMax.coerceAtLeast(0)
