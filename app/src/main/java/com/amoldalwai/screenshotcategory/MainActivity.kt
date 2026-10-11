@@ -328,6 +328,11 @@ class MainActivity : ComponentActivity() {
         var showAllGallery by remember { mutableStateOf(false) }
         var selectedGalleryImage by remember { mutableStateOf<Screenshot?>(null) }
         var isMetricsRefreshing by remember { mutableStateOf(false) }
+        var showModelSetupDetails by remember { mutableStateOf(false) }
+        var showPermissionSetupDetails by remember { mutableStateOf(false) }
+        var showWelcomeSplash by remember {
+            mutableStateOf(!preferences.getBoolean(FIRST_LAUNCH_DONE_KEY, false))
+        }
         var isCategorySectionLoading by remember { mutableStateOf(true) }
         var isScreenshotSectionLoading by remember { mutableStateOf(true) }
         var selectedImageProfile by remember { mutableStateOf<Pair<Screenshot, ClassifiedImage>?>(null) }
@@ -565,6 +570,10 @@ class MainActivity : ComponentActivity() {
                 val classifiedScreenshotsCount = screenshots.count {
                     uriKeyFor(it.uri.toString()) in classifications
                 }
+                val hasMediaPermission = ContextCompat.checkSelfPermission(
+                    this@MainActivity,
+                    Manifest.permission.READ_MEDIA_IMAGES
+                ) == PackageManager.PERMISSION_GRANTED
 
                 Box(
                     modifier = Modifier
@@ -879,35 +888,46 @@ class MainActivity : ComponentActivity() {
                                     }
                                 }
                             }
+                            if (!modelDownload.isReady() || !hasMediaPermission) {
+                                item {
+                                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                                        if (!modelDownload.isReady()) {
+                                            SetupStepCard(
+                                                icon = Icons.Outlined.Add,
+                                                title = "Download AI model",
+                                                summary = "Required once to run local screenshot classification.",
+                                                expanded = showModelSetupDetails,
+                                                onToggle = { showModelSetupDetails = !showModelSetupDetails },
+                                                details = "SnapSortix runs on-device AI. Downloading Gemma enables private, offline-friendly screenshot categorization on your phone.",
+                                                actionLabel = "Download now",
+                                                onAction = {
+                                                    modelDownload.enqueue()
+                                                    status = "Model download started. Keep app installed while it completes."
+                                                }
+                                            )
+                                        }
+                                        if (!hasMediaPermission) {
+                                            SetupStepCard(
+                                                icon = Icons.Outlined.PhotoLibrary,
+                                                title = "Allow photo access",
+                                                summary = "Needed to read screenshots and categorize them.",
+                                                expanded = showPermissionSetupDetails,
+                                                onToggle = { showPermissionSetupDetails = !showPermissionSetupDetails },
+                                                details = "SnapSortix only reads screenshot metadata and image content for classification. Without permission, it cannot detect new screenshots.",
+                                                actionLabel = "Grant access",
+                                                onAction = {
+                                                    permissionLauncher.launch(Manifest.permission.READ_MEDIA_IMAGES)
+                                                }
+                                            )
+                                        }
+                                    }
+                                }
+                            }
                             item {
                                 Row(
                                     horizontalArrangement = Arrangement.spacedBy(16.dp),
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
-                                    val hasMediaPermission = ContextCompat.checkSelfPermission(
-                                        this@MainActivity,
-                                        Manifest.permission.READ_MEDIA_IMAGES
-                                    ) == PackageManager.PERMISSION_GRANTED
-
-                                    if (!modelDownload.isReady()) {
-                                        QuickAction(
-                                            icon = Icons.Outlined.Add,
-                                            label = "Model",
-                                            onClick = {
-                                                modelDownload.enqueue()
-                                                status = "Download started. Keep the app installed while it completes."
-                                            }
-                                        )
-                                    }
-                                    if (!hasMediaPermission) {
-                                        QuickAction(
-                                            icon = Icons.Outlined.PhotoLibrary,
-                                            label = "Access",
-                                            onClick = {
-                                                permissionLauncher.launch(Manifest.permission.READ_MEDIA_IMAGES)
-                                            }
-                                        )
-                                    }
                                     QuickAction(
                                         icon = if (isBackgroundClassifying) Icons.Outlined.Close else Icons.Outlined.Check,
                                         label = if (isBackgroundClassifying) "Stop" else "Classify 10",
@@ -1313,6 +1333,25 @@ class MainActivity : ComponentActivity() {
                             }
                         )
                     }
+
+                    if (showWelcomeSplash) {
+                        WelcomeSplashDialog(
+                            modelReady = modelDownload.isReady(),
+                            hasPhotoPermission = hasMediaPermission,
+                            onDownloadModel = {
+                                modelDownload.enqueue()
+                                status = "Model download started."
+                            },
+                            onGrantPermission = {
+                                permissionLauncher.launch(Manifest.permission.READ_MEDIA_IMAGES)
+                            },
+                            onContinue = {
+                                preferences.edit().putBoolean(FIRST_LAUNCH_DONE_KEY, true).apply()
+                                showWelcomeSplash = false
+                                status = "Welcome to SnapSortix. Complete setup cards to start auto classification."
+                            }
+                        )
+                    }
                 }
             }
         }
@@ -1347,6 +1386,7 @@ private const val CATEGORY_DEFAULTS_VERSION_KEY = "category_defaults_version"
 private const val CUSTOM_PROMPT_PREFERENCES_KEY = "custom_prompt"
 private const val VISION_MODE_PREFERENCES_KEY = "vision_mode"
 private const val CLASSIFICATION_STORE_FILE_NAME = "classification_index.json"
+private const val FIRST_LAUNCH_DONE_KEY = "first_launch_done"
 private const val CATEGORY_DEFAULTS_VERSION = 3
 private const val IDENTITY_CARDS_CATEGORY = "Identity cards"
 private const val MOVIE_CATEGORY = "Movie"
@@ -1838,6 +1878,112 @@ private fun QuickAction(
             fontWeight = FontWeight.Medium
         )
     }
+}
+
+@Composable
+private fun SetupStepCard(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    title: String,
+    summary: String,
+    expanded: Boolean,
+    onToggle: () -> Unit,
+    details: String,
+    actionLabel: String,
+    onAction: () -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFFEFF6FF)),
+        shape = androidx.compose.foundation.shape.RoundedCornerShape(14.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(icon, contentDescription = title, tint = Color(0xFF2F6E6A))
+                    Text(
+                        text = title,
+                        style = MaterialTheme.typography.titleSmall,
+                        color = Color(0xFF1E3A5F),
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+                TextButton(onClick = onToggle) {
+                    Text(if (expanded) "Hide" else "Why?")
+                }
+            }
+            Text(
+                text = summary,
+                style = MaterialTheme.typography.bodySmall,
+                color = Color(0xFF355C7D)
+            )
+            if (expanded) {
+                HorizontalDivider(color = Color(0xFFD6E4F3))
+                Text(
+                    text = details,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color(0xFF355C7D)
+                )
+            }
+            Button(onClick = onAction) {
+                Text(actionLabel)
+            }
+        }
+    }
+}
+
+@Composable
+private fun WelcomeSplashDialog(
+    modelReady: Boolean,
+    hasPhotoPermission: Boolean,
+    onDownloadModel: () -> Unit,
+    onGrantPermission: () -> Unit,
+    onContinue: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onContinue,
+        title = { Text("Welcome to SnapSortix") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    "SnapSortix auto-organizes your screenshots using on-device AI. Complete these 2 setup steps to get started:",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = Color(0xFF355C7D)
+                )
+                Text(
+                    "1. Download Gemma model (${if (modelReady) "Done" else "Pending"})\n2. Grant photo permission (${if (hasPhotoPermission) "Done" else "Pending"})",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color(0xFF1E3A5F)
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (!modelReady) {
+                        TextButton(onClick = onDownloadModel) {
+                            Text("Download model")
+                        }
+                    }
+                    if (!hasPhotoPermission) {
+                        TextButton(onClick = onGrantPermission) {
+                            Text("Grant photos")
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onContinue) {
+                Text("Continue")
+            }
+        }
+    )
 }
 
 @Composable
