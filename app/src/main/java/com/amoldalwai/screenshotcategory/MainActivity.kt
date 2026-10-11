@@ -21,6 +21,7 @@ import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.border
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -85,6 +86,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -588,7 +590,7 @@ class MainActivity : ComponentActivity() {
                         val hasBackTarget = selectedCategory != null || showAllGallery
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
                             if (hasBackTarget) {
                                 IconButton(onClick = {
@@ -604,6 +606,11 @@ class MainActivity : ComponentActivity() {
                                     )
                                 }
                             }
+                            Image(
+                                painter = painterResource(id = R.drawable.app_logo),
+                                contentDescription = "SnapSortix logo",
+                                modifier = Modifier.size(30.dp)
+                            )
                             Text(
                                 "SnapSortix",
                                 style = MaterialTheme.typography.headlineSmall,
@@ -706,14 +713,6 @@ class MainActivity : ComponentActivity() {
                             verticalArrangement = Arrangement.spacedBy(12.dp),
                             contentPadding = PaddingValues(bottom = 16.dp)
                         ) {
-                            item {
-                                Text(
-                                    "SNAPSORTIX",
-                                    color = Color(0xFF2F6E6A),
-                                    style = MaterialTheme.typography.labelLarge,
-                                    fontWeight = FontWeight.Bold
-                                )
-                            }
                             item {
                                 SearchField(
                                     value = searchQuery,

@@ -7,7 +7,9 @@
 
     <application
         android:allowBackup="true"
+        android:icon="@drawable/app_logo"
         android:label="SnapSortix"
+        android:roundIcon="@drawable/app_logo"
         android:supportsRtl="true"
         android:theme="@style/Theme.ScreenshotCategoryApp">
         <uses-native-library android:name="libvndksupport.so" android:required="false" />
