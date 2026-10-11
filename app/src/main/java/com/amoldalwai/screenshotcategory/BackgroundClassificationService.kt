@@ -74,7 +74,11 @@ class BackgroundClassificationService : Service() {
 
         if (watcherEnabled) {
             serviceScope.launch {
-                enqueueUnclassifiedRecent(limit = requestedLimit, notifyWhenIdle = true)
+                enqueueUnclassifiedRecent(
+                    limit = requestedLimit,
+                    notifyWhenIdle = true,
+                    includeOnlyAfterWatermark = requestedLimit == Int.MAX_VALUE
+                )
             }
             return START_STICKY
         }
@@ -178,7 +182,7 @@ class BackgroundClassificationService : Service() {
         registerScreenshotObserver()
         serviceScope.launch {
             // Catch screenshots that land before observer callbacks are delivered.
-            enqueueUnclassifiedRecent(limit = 80, notifyWhenIdle = false)
+            enqueueUnclassifiedRecent(limit = 80, notifyWhenIdle = false, includeOnlyAfterWatermark = true)
         }
         startFallbackScanLoop()
         showWatcherForeground(
@@ -195,7 +199,7 @@ class BackgroundClassificationService : Service() {
         fallbackScanJob = serviceScope.launch {
             while (watcherEnabled) {
                 delay(WATCHER_FALLBACK_SCAN_MS)
-                enqueueUnclassifiedRecent(limit = 30, notifyWhenIdle = false)
+                enqueueUnclassifiedRecent(limit = 30, notifyWhenIdle = false, includeOnlyAfterWatermark = true)
             }
         }
     }
@@ -243,11 +247,15 @@ class BackgroundClassificationService : Service() {
         debounceJob?.cancel()
         debounceJob = serviceScope.launch {
             delay(900)
-            enqueueUnclassifiedRecent(limit = 40, notifyWhenIdle = true)
+            enqueueUnclassifiedRecent(limit = 40, notifyWhenIdle = true, includeOnlyAfterWatermark = true)
         }
     }
 
-    private suspend fun enqueueUnclassifiedRecent(limit: Int, notifyWhenIdle: Boolean) {
+    private suspend fun enqueueUnclassifiedRecent(
+        limit: Int,
+        notifyWhenIdle: Boolean,
+        includeOnlyAfterWatermark: Boolean
+    ) {
         if (!watcherEnabled) return
         if (storedClassifications.isEmpty()) {
             val storeFile = File(filesDir, CLASSIFICATION_STORE_FILE_NAME)
@@ -258,8 +266,8 @@ class BackgroundClassificationService : Service() {
         var newQueued = 0
         var skippedAlreadyClassified = 0
         var maxSeenThisPass = currentWatermark
-        latest.asReversed().forEach { item ->
-            if (!isAfterWatermark(item, currentWatermark)) return@forEach
+        latest.forEach { item ->
+            if (includeOnlyAfterWatermark && !isAfterWatermark(item, currentWatermark)) return@forEach
             if (isAfterWatermark(item, maxSeenThisPass)) {
                 maxSeenThisPass = ScanWatermark(item.dateAddedSeconds, item.mediaId)
             }
@@ -344,6 +352,7 @@ class BackgroundClassificationService : Service() {
         val collection = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
         val projection = arrayOf(
             MediaStore.Images.Media._ID,
+            MediaStore.Images.Media.DATE_TAKEN,
             MediaStore.Images.Media.DATE_ADDED,
             MediaStore.Images.Media.DISPLAY_NAME,
             MediaStore.Images.Media.RELATIVE_PATH,
@@ -353,7 +362,7 @@ class BackgroundClassificationService : Service() {
             "${MediaStore.Images.Media.BUCKET_DISPLAY_NAME} LIKE ? OR " +
             "${MediaStore.Images.Media.DISPLAY_NAME} LIKE ?)"
         val selectionArgs = arrayOf("%Screenshot%", "%Screenshot%", "Screenshot%")
-        val sortOrder = "${MediaStore.Images.Media.DATE_ADDED} DESC, ${MediaStore.Images.Media._ID} DESC"
+        val sortOrder = "${MediaStore.Images.Media.DATE_TAKEN} DESC, ${MediaStore.Images.Media.DATE_ADDED} DESC, ${MediaStore.Images.Media._ID} DESC"
 
         return runCatching {
             buildList {
@@ -366,13 +375,20 @@ class BackgroundClassificationService : Service() {
                     sortOrder
                 )?.use { cursor ->
                     val idIndex = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
+                    val dateTakenIndex = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_TAKEN)
                     val dateIndex = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_ADDED)
                     val nameIndex = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DISPLAY_NAME)
                     val pathIndex = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.RELATIVE_PATH)
                     while (cursor.moveToNext()) {
                         if (size >= safeLimit) break
                         val id = cursor.getLong(idIndex)
+                        val dateTakenMs = cursor.getLong(dateTakenIndex)
                         val dateAdded = cursor.getLong(dateIndex)
+                        val createdAtMs = when {
+                            dateTakenMs > 0L -> dateTakenMs
+                            dateAdded > 0L -> dateAdded * 1000L
+                            else -> null
+                        }
                         val uri = ContentUris.withAppendedId(collection, id)
                         val key = uri.toString()
                         if (!seen.add(key)) continue
@@ -382,7 +398,8 @@ class BackgroundClassificationService : Service() {
                                     imageId = id.toString(),
                                     uri = uri,
                                     displayName = cursor.getString(nameIndex),
-                                    relativePath = cursor.getString(pathIndex)
+                                    relativePath = cursor.getString(pathIndex),
+                                    createdAtMs = createdAtMs
                                 ),
                                 dateAddedSeconds = dateAdded,
                                 mediaId = id
@@ -487,6 +504,7 @@ class BackgroundClassificationService : Service() {
                 val savedEntry = JSONObject().apply {
                     put("imageId", screenshot.imageId)
                     put("imageUri", screenshot.uri.toString())
+                    put("imageCreatedAtMs", screenshot.createdAtMs ?: JSONObject.NULL)
                     put("category", result.classification.category)
                     put("confidence", result.classification.confidence)
                     put("description", result.classification.description)
@@ -566,6 +584,25 @@ class BackgroundClassificationService : Service() {
             )
         }
 
+        val watcherAttempted = done + failedPermanent
+        if (watcherAttempted > 0) {
+            val avgMs = ((System.currentTimeMillis() - startedMs) / watcherAttempted.coerceAtLeast(1)).coerceAtLeast(0L)
+            appendClassificationHistory(
+                context = this,
+                entry = ClassificationHistoryEntry(
+                    timestampMs = System.currentTimeMillis(),
+                    source = "Auto detect",
+                    status = if (failedPermanent == 0) "Success" else "Partial",
+                    imageCount = watcherAttempted,
+                    successCount = done,
+                    failedCount = failedPermanent,
+                    averageTimeMs = avgMs,
+                    backend = runtimeBackend,
+                    note = "Queue run"
+                )
+            )
+        }
+
         storedClassifications = existing
         progressDone = 0
         progressTotal = 0
@@ -614,9 +651,7 @@ class BackgroundClassificationService : Service() {
         val modelDownload = ModelDownload(this)
         if (!modelDownload.isReady()) {
             updateNotification("Model missing", "Download Gemma model from app first.")
-            isBatchRunning = false
-            isRunning = watcherEnabled
-            stopSelf()
+            finishBatchAndMaybeStopService()
             return
         }
 
@@ -641,9 +676,7 @@ class BackgroundClassificationService : Service() {
 
         if (pending.isEmpty()) {
             updateNotification("Nothing to classify", "All recent screenshots are already categorized.")
-            isBatchRunning = false
-            isRunning = watcherEnabled
-            stopSelf()
+            finishBatchAndMaybeStopService()
             return
         }
 
@@ -698,6 +731,7 @@ class BackgroundClassificationService : Service() {
                     val savedEntry = JSONObject().apply {
                         put("imageId", screenshot.imageId)
                         put("imageUri", screenshot.uri.toString())
+                        put("imageCreatedAtMs", screenshot.createdAtMs ?: JSONObject.NULL)
                         put("category", result.classification.category)
                         put("confidence", result.classification.confidence)
                         put("description", result.classification.description)
@@ -745,14 +779,48 @@ class BackgroundClassificationService : Service() {
             } else {
                 "Completed: $done success, $failed failed | avg ${formatAverageSeconds(startEpochMs, pending.size)}s/img"
             }
+            val batchAttempted = done + failed
+            if (batchAttempted > 0) {
+                val avgMs = ((System.currentTimeMillis() - startEpochMs) / batchAttempted.coerceAtLeast(1)).coerceAtLeast(0L)
+                appendClassificationHistory(
+                    context = this,
+                    entry = ClassificationHistoryEntry(
+                        timestampMs = System.currentTimeMillis(),
+                        source = "Classify 10",
+                        status = if (failed == 0) "Success" else "Partial",
+                        imageCount = batchAttempted,
+                        successCount = done,
+                        failedCount = failed,
+                        averageTimeMs = avgMs,
+                        backend = runtimeBackend,
+                        note = "Batch run"
+                    )
+                )
+            }
             progressDone = progressTotal
             updateNotification("Background classification complete", resultText)
-            isBatchRunning = false
-            isRunning = watcherEnabled
-            stopSelf()
+            finishBatchAndMaybeStopService()
         } finally {
             activeClassifier.close()
             classifier = null
+        }
+    }
+
+    private fun finishBatchAndMaybeStopService() {
+        isBatchRunning = false
+        isRunning = watcherEnabled
+        if (watcherEnabled) return
+
+        runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+            } else {
+                @Suppress("DEPRECATION")
+                stopForeground(true)
+            }
+            stopSelf()
+        }.onFailure {
+            Log.w(TAG, "Unable to stop batch service cleanly", it)
         }
     }
 

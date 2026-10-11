@@ -11,7 +11,8 @@ data class Screenshot(
     val imageId: String,
     val uri: Uri,
     val displayName: String,
-    val relativePath: String?
+    val relativePath: String?,
+    val createdAtMs: Long?
 )
 
 class ScreenshotMedia(private val context: Context) {
@@ -19,6 +20,8 @@ class ScreenshotMedia(private val context: Context) {
         val collection = MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)
         val projection = arrayOf(
             MediaStore.Images.Media._ID,
+            MediaStore.Images.Media.DATE_TAKEN,
+            MediaStore.Images.Media.DATE_ADDED,
             MediaStore.Images.Media.DISPLAY_NAME,
             MediaStore.Images.Media.RELATIVE_PATH,
             MediaStore.Images.Media.BUCKET_DISPLAY_NAME
@@ -45,6 +48,7 @@ class ScreenshotMedia(private val context: Context) {
                     putStringArray(
                         ContentResolver.QUERY_ARG_SORT_COLUMNS,
                         arrayOf(
+                            MediaStore.Images.Media.DATE_TAKEN,
                             MediaStore.Images.Media.DATE_ADDED,
                             MediaStore.Images.Media._ID
                         )
@@ -61,11 +65,20 @@ class ScreenshotMedia(private val context: Context) {
                 context.contentResolver.query(collection, projection, queryArgs, null)
                     ?.use { cursor ->
                         val idIndex = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
+                        val dateTakenIndex = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_TAKEN)
+                        val dateAddedIndex = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_ADDED)
                         val nameIndex = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DISPLAY_NAME)
                         val pathIndex = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.RELATIVE_PATH)
                         while (cursor.moveToNext()) {
                             fetchedInPage += 1
                             val imageId = cursor.getLong(idIndex)
+                            val dateTakenMs = cursor.getLong(dateTakenIndex)
+                            val dateAddedSec = cursor.getLong(dateAddedIndex)
+                            val createdAtMs = when {
+                                dateTakenMs > 0L -> dateTakenMs
+                                dateAddedSec > 0L -> dateAddedSec * 1000L
+                                else -> null
+                            }
                             val imageUri = ContentUris.withAppendedId(collection, imageId)
                             val uriKey = imageUri.toString()
                             if (!seenUris.add(uriKey)) {
@@ -76,7 +89,8 @@ class ScreenshotMedia(private val context: Context) {
                                     imageId = imageId.toString(),
                                     uri = imageUri,
                                     displayName = cursor.getString(nameIndex),
-                                    relativePath = cursor.getString(pathIndex)
+                                    relativePath = cursor.getString(pathIndex),
+                                    createdAtMs = createdAtMs
                                 )
                             )
                         }

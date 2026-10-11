@@ -106,6 +106,7 @@ class MainActivity : ComponentActivity() {
     private var classifier: GemmaClassifier? = null
     private val preferences by lazy { getSharedPreferences("screenshot_sorter", MODE_PRIVATE) }
     private val classificationStoreFile by lazy { File(filesDir, CLASSIFICATION_STORE_FILE_NAME) }
+    private val classificationHistoryStoreFile by lazy { File(filesDir, CLASSIFICATION_HISTORY_FILE_NAME) }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -188,6 +189,11 @@ class MainActivity : ComponentActivity() {
                         ClassifiedImage(
                             imageId = item.optString("imageId").ifBlank { imageUri },
                             imageUri = imageUri,
+                            imageCreatedAtMs = if (item.has("imageCreatedAtMs") && !item.isNull("imageCreatedAtMs")) {
+                                item.optLong("imageCreatedAtMs")
+                            } else {
+                                null
+                            },
                             category = item.optString("category").ifBlank { "Others" },
                             confidence = confidence,
                             description = item.optString("description").orEmpty(),
@@ -206,6 +212,7 @@ class MainActivity : ComponentActivity() {
                 JSONObject().apply {
                     put("imageId", classification.imageId)
                     put("imageUri", classification.imageUri)
+                    put("imageCreatedAtMs", classification.imageCreatedAtMs ?: JSONObject.NULL)
                     put("category", classification.category)
                     put("confidence", classification.confidence)
                     put("description", classification.description)
@@ -277,7 +284,8 @@ class MainActivity : ComponentActivity() {
                     imageId = saved.imageId,
                     uri = Uri.parse(saved.imageUri),
                     displayName = "Restored image",
-                    relativePath = "Saved"
+                    relativePath = "Saved",
+                    createdAtMs = saved.imageCreatedAtMs
                 )
             }
         return (dedupedScanned + restored).distinctBy { it.uri.toString() }
@@ -295,9 +303,6 @@ class MainActivity : ComponentActivity() {
         var showSettings by remember { mutableStateOf(false) }
         var showDiscardChanges by remember { mutableStateOf(false) }
         var showDeleteAllClassificationsDialog by remember { mutableStateOf(false) }
-        var showPhoneScreenshotPicker by remember { mutableStateOf(false) }
-        var phoneScreenshotPickerItems by remember { mutableStateOf(emptyList<Screenshot>()) }
-        var isPhoneScreenshotPickerLoading by remember { mutableStateOf(false) }
         var activeClassification by remember { mutableStateOf<UriKey?>(null) }
         var activeReclassification by remember { mutableStateOf<UriKey?>(null) }
         var isModelPreparing by remember { mutableStateOf(false) }
@@ -333,6 +338,7 @@ class MainActivity : ComponentActivity() {
         var showWelcomeSplash by remember {
             mutableStateOf(!preferences.getBoolean(FIRST_LAUNCH_DONE_KEY, false))
         }
+        var showRecentClassificationDetails by remember { mutableStateOf(false) }
         var isCategorySectionLoading by remember { mutableStateOf(true) }
         var isScreenshotSectionLoading by remember { mutableStateOf(true) }
         var selectedImageProfile by remember { mutableStateOf<Pair<Screenshot, ClassifiedImage>?>(null) }
@@ -346,6 +352,14 @@ class MainActivity : ComponentActivity() {
             )
         }
         var classifications by remember { mutableStateOf(loadClassificationsFromDisk()) }
+        var classificationHistory by remember {
+            mutableStateOf(
+                loadClassificationHistoryFromDisk(
+                    classificationHistoryStoreFile,
+                    limit = MAX_CLASSIFICATION_HISTORY_ENTRIES
+                )
+            )
+        }
         val permissionLauncher = rememberLauncherForActivityResult(
             ActivityResultContracts.RequestPermission()
         ) { granted ->
@@ -386,7 +400,8 @@ class MainActivity : ComponentActivity() {
                     imageId = selectedUri.lastPathSegment ?: selectedUri.toString(),
                     uri = selectedUri,
                     displayName = "Selected gallery image",
-                    relativePath = "Gallery"
+                    relativePath = "Gallery",
+                    createdAtMs = null
                 )
                 selectedGalleryImage = selectedImage
                 screenshots = listOf(selectedImage) + screenshots.filterNot { it.uri == selectedUri }
@@ -477,6 +492,12 @@ class MainActivity : ComponentActivity() {
                     if (latest.size != classifications.size) {
                         classifications = latest
                     }
+                    classificationHistory = withContext(Dispatchers.IO) {
+                        loadClassificationHistoryFromDisk(
+                            classificationHistoryStoreFile,
+                            limit = MAX_CLASSIFICATION_HISTORY_ENTRIES
+                        )
+                    }
                 }
                 delay(500)
             }
@@ -511,9 +532,10 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
-                suspend fun classifyAndPersist(screenshot: Screenshot): Boolean {
+                suspend fun classifyAndPersist(screenshot: Screenshot, source: String): Boolean {
                     val imageKey = uriKeyFor(screenshot.uri.toString())
                     activeClassification = imageKey
+                    val startedAt = System.currentTimeMillis()
                     val result = runCatching {
                         withContext(Dispatchers.IO) {
                             val activeClassifier = classifier ?: GemmaClassifier(
@@ -533,6 +555,7 @@ class MainActivity : ComponentActivity() {
                         val savedEntry = ClassifiedImage(
                             imageId = screenshot.imageId,
                             imageUri = screenshot.uri.toString(),
+                            imageCreatedAtMs = screenshot.createdAtMs,
                             category = classification.category,
                             confidence = classification.confidence,
                             description = classification.description,
@@ -542,7 +565,28 @@ class MainActivity : ComponentActivity() {
                         classifications = updated
                         withContext(Dispatchers.IO) {
                             saveClassificationsToDisk(updated.values)
+                            appendClassificationHistory(
+                                context = this@MainActivity,
+                                entry = ClassificationHistoryEntry(
+                                    timestampMs = System.currentTimeMillis(),
+                                    source = source,
+                                    status = "Success",
+                                    imageCount = 1,
+                                    successCount = 1,
+                                    failedCount = 0,
+                                    averageTimeMs = (System.currentTimeMillis() - startedAt).coerceAtLeast(0L),
+                                    backend = "Gemma local",
+                                    note = classification.category
+                                )
+                            )
                         }
+                        classificationHistory = withContext(Dispatchers.IO) {
+                            loadClassificationHistoryFromDisk(
+                                classificationHistoryStoreFile,
+                                limit = MAX_CLASSIFICATION_HISTORY_ENTRIES
+                            )
+                        }
+                        true
                     }.getOrElse { false }
                 }
 
@@ -924,77 +968,56 @@ class MainActivity : ComponentActivity() {
                                 }
                             }
                             item {
+                                ClassifyTenControlCard(
+                                    isRunning = isBackgroundClassifying,
+                                    queueCount = watcherQueueCount,
+                                    onToggle = {
+                                        if (!modelDownload.isReady()) {
+                                            status = "Download the model first."
+                                            return@ClassifyTenControlCard
+                                        }
+                                        if (isBackgroundClassifying) {
+                                            BackgroundClassificationService.stop(this@MainActivity)
+                                            status = "Stopping background classification..."
+                                            return@ClassifyTenControlCard
+                                        }
+
+                                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                            val hasNotificationPermission = ContextCompat.checkSelfPermission(
+                                                this@MainActivity,
+                                                Manifest.permission.POST_NOTIFICATIONS
+                                            ) == PackageManager.PERMISSION_GRANTED
+                                            if (!hasNotificationPermission) {
+                                                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                                            }
+                                        }
+
+                                        val pending = screenshots.filter { shot ->
+                                            uriKeyFor(shot.uri.toString()) !in classifications
+                                        }.take(10)
+                                        if (pending.isEmpty()) {
+                                            status = "No uncategorized screenshots available in latest 10."
+                                            return@ClassifyTenControlCard
+                                        }
+
+                                        BackgroundClassificationService.start(
+                                            context = this@MainActivity,
+                                            limit = 10
+                                        )
+                                        status = "Classify 10 started. Latest uncategorized screenshots will be processed first."
+                                    }
+                                )
+                            }
+                            item {
                                 Row(
                                     horizontalArrangement = Arrangement.spacedBy(16.dp),
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
                                     QuickAction(
-                                        icon = if (isBackgroundClassifying) Icons.Outlined.Close else Icons.Outlined.Check,
-                                        label = if (isBackgroundClassifying) "Stop" else "Classify 10",
-                                        onClick = {
-                                            if (!modelDownload.isReady()) {
-                                                status = "Download the model first."
-                                                return@QuickAction
-                                            }
-                                            if (isBackgroundClassifying) {
-                                                BackgroundClassificationService.stop(this@MainActivity)
-                                                status = "Stopping background classification..."
-                                                return@QuickAction
-                                            }
-
-                                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                                                val hasNotificationPermission = ContextCompat.checkSelfPermission(
-                                                    this@MainActivity,
-                                                    Manifest.permission.POST_NOTIFICATIONS
-                                                ) == PackageManager.PERMISSION_GRANTED
-                                                if (!hasNotificationPermission) {
-                                                    notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
-                                                }
-                                            }
-
-                                            val pending = screenshots.filter { shot ->
-                                                uriKeyFor(shot.uri.toString()) !in classifications
-                                            }.take(10)
-                                            if (pending.isEmpty()) {
-                                                status = "No uncategorized screenshots available in top 10."
-                                                return@QuickAction
-                                            }
-
-                                            BackgroundClassificationService.start(
-                                                context = this@MainActivity,
-                                                limit = 10
-                                            )
-                                            status = "Background Classify 10 started. You can leave app; progress and avg time are in notification."
-                                        }
-                                    )
-                                    QuickAction(
                                         icon = Icons.Outlined.PhotoLibrary,
                                         label = "Gallery",
                                         onClick = {
                                             galleryPicker.launch(arrayOf("image/*"))
-                                        }
-                                    )
-                                    QuickAction(
-                                        icon = Icons.Outlined.PhotoLibrary,
-                                        label = "Phone",
-                                        onClick = {
-                                            if (ContextCompat.checkSelfPermission(
-                                                    this@MainActivity,
-                                                    Manifest.permission.READ_MEDIA_IMAGES
-                                                ) != PackageManager.PERMISSION_GRANTED
-                                            ) {
-                                                permissionLauncher.launch(Manifest.permission.READ_MEDIA_IMAGES)
-                                                return@QuickAction
-                                            }
-                                            showPhoneScreenshotPicker = true
-                                            isPhoneScreenshotPickerLoading = true
-                                            lifecycleScope.launch {
-                                                val screenshotOnly = withContext(Dispatchers.IO) {
-                                                    ScreenshotMedia(this@MainActivity).loadRecentScreenshots(maxCount = 400)
-                                                }.distinctBy { it.uri.toString() }
-                                                phoneScreenshotPickerItems = screenshotOnly
-                                                isPhoneScreenshotPickerLoading = false
-                                            }
                                         }
                                     )
                                     QuickAction(
@@ -1065,6 +1088,15 @@ class MainActivity : ComponentActivity() {
                                             }
                                         },
                                         showAllCategories = showAllCategories
+                                    )
+                                }
+                                item {
+                                    RecentClassificationCard(
+                                        history = classificationHistory,
+                                        expanded = showRecentClassificationDetails,
+                                        onToggleExpanded = {
+                                            showRecentClassificationDetails = !showRecentClassificationDetails
+                                        }
                                     )
                                 }
                             }
@@ -1141,7 +1173,7 @@ class MainActivity : ComponentActivity() {
                                                     } else {
                                                         "Re-classifying ${galleryImage.displayName} with latest prompt..."
                                                     }
-                                                    val savedToDisk = classifyAndPersist(galleryImage)
+                                                    val savedToDisk = classifyAndPersist(galleryImage, source = "Gallery reclassify")
                                                     activeReclassification = null
                                                     status = if (savedToDisk) {
                                                         "Re-classification finished. Category has been updated."
@@ -1157,7 +1189,7 @@ class MainActivity : ComponentActivity() {
                                                     } else {
                                                         "Classifying ${galleryImage.displayName}..."
                                                     }
-                                                    val savedToDisk = classifyAndPersist(galleryImage)
+                                                    val savedToDisk = classifyAndPersist(galleryImage, source = "Gallery classify")
                                                     status = if (savedToDisk) {
                                                         "Classification finished."
                                                     } else {
@@ -1196,7 +1228,25 @@ class MainActivity : ComponentActivity() {
                                 classifications = updatedMap
                                 lifecycleScope.launch(Dispatchers.IO) {
                                     saveClassificationsToDisk(updatedMap.values)
+                                    appendClassificationHistory(
+                                        context = this@MainActivity,
+                                        entry = ClassificationHistoryEntry(
+                                            timestampMs = System.currentTimeMillis(),
+                                            source = "Manual edit",
+                                            status = "Success",
+                                            imageCount = 1,
+                                            successCount = 1,
+                                            failedCount = 0,
+                                            averageTimeMs = 0L,
+                                            backend = "UI",
+                                            note = updatedCategory
+                                        )
+                                    )
                                 }
+                                classificationHistory = loadClassificationHistoryFromDisk(
+                                    classificationHistoryStoreFile,
+                                    limit = MAX_CLASSIFICATION_HISTORY_ENTRIES
+                                )
                                 status = "Updated classification for ${screenshot.displayName}."
                                 selectedImageProfile = screenshot to updatedEntry
                                 true
@@ -1210,7 +1260,7 @@ class MainActivity : ComponentActivity() {
                                     } else {
                                         "Re-classifying ${screenshot.displayName} with latest prompt..."
                                     }
-                                    val savedToDisk = classifyAndPersist(screenshot)
+                                    val savedToDisk = classifyAndPersist(screenshot, source = "Gallery reclassify")
                                     activeReclassification = null
                                     if (savedToDisk) {
                                         val latest = classifications[uriKeyFor(screenshot.uri.toString())]
@@ -1252,83 +1302,6 @@ class MainActivity : ComponentActivity() {
                             dismissButton = {
                                 TextButton(onClick = { showDeleteAllClassificationsDialog = false }) {
                                     Text("Cancel")
-                                }
-                            }
-                        )
-                    }
-
-                    if (showPhoneScreenshotPicker) {
-                        AlertDialog(
-                            onDismissRequest = { showPhoneScreenshotPicker = false },
-                            title = { Text("Pick from Screenshots") },
-                            text = {
-                                if (isPhoneScreenshotPickerLoading) {
-                                    Column(
-                                        modifier = Modifier.fillMaxWidth(),
-                                        horizontalAlignment = Alignment.CenterHorizontally,
-                                        verticalArrangement = Arrangement.spacedBy(10.dp)
-                                    ) {
-                                        CircularProgressIndicator()
-                                        Text("Loading screenshots...")
-                                    }
-                                } else {
-                                    if (phoneScreenshotPickerItems.isEmpty()) {
-                                        Text("No screenshots found in your Screenshots folder.")
-                                    } else {
-                                        LazyColumn(
-                                            modifier = Modifier
-                                                .fillMaxWidth()
-                                                .height(360.dp),
-                                            verticalArrangement = Arrangement.spacedBy(8.dp)
-                                        ) {
-                                            items(phoneScreenshotPickerItems.take(200)) { shot ->
-                                                Row(
-                                                    modifier = Modifier
-                                                        .fillMaxWidth()
-                                                        .clip(androidx.compose.foundation.shape.RoundedCornerShape(10.dp))
-                                                        .clickable {
-                                                            selectedGalleryImage = shot
-                                                            screenshots = listOf(shot) + screenshots.filterNot { it.uri == shot.uri }
-                                                            showPhoneScreenshotPicker = false
-                                                            status = "Screenshot selected from Screenshots folder."
-                                                        }
-                                                        .padding(8.dp),
-                                                    verticalAlignment = Alignment.CenterVertically,
-                                                    horizontalArrangement = Arrangement.spacedBy(10.dp)
-                                                ) {
-                                                    AsyncImage(
-                                                        model = shot.uri,
-                                                        contentDescription = shot.displayName,
-                                                        contentScale = ContentScale.Crop,
-                                                        modifier = Modifier
-                                                            .size(56.dp)
-                                                            .clip(androidx.compose.foundation.shape.RoundedCornerShape(8.dp))
-                                                    )
-                                                    Column {
-                                                        Text(
-                                                            text = shot.displayName,
-                                                            maxLines = 1,
-                                                            overflow = TextOverflow.Ellipsis,
-                                                            fontWeight = FontWeight.Medium,
-                                                            color = Color(0xFF102A43)
-                                                        )
-                                                        Text(
-                                                            text = shot.relativePath.orEmpty(),
-                                                            maxLines = 1,
-                                                            overflow = TextOverflow.Ellipsis,
-                                                            style = MaterialTheme.typography.bodySmall,
-                                                            color = Color(0xFF4A6572)
-                                                        )
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            },
-                            confirmButton = {
-                                TextButton(onClick = { showPhoneScreenshotPicker = false }) {
-                                    Text("Close")
                                 }
                             }
                         )
@@ -1396,6 +1369,7 @@ private const val OTP_CATEGORY = "OTP/Verification Codes"
 private data class ClassifiedImage(
     val imageId: String,
     val imageUri: String,
+    val imageCreatedAtMs: Long?,
     val category: String,
     val confidence: Float,
     val description: String,
@@ -1942,6 +1916,167 @@ private fun SetupStepCard(
 }
 
 @Composable
+private fun ClassifyTenControlCard(
+    isRunning: Boolean,
+    queueCount: Int,
+    onToggle: () -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFFEAF3FF)),
+        shape = androidx.compose.foundation.shape.RoundedCornerShape(16.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text(
+                        text = "Classify Latest 10",
+                        style = MaterialTheme.typography.titleMedium,
+                        color = Color(0xFF1E3A5F),
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Text(
+                        text = "Processes newest uncategorized screenshots first and skips already classified ones.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color(0xFF355C7D)
+                    )
+                }
+                Button(onClick = onToggle) {
+                    Text(if (isRunning) "Stop" else "Run")
+                }
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
+                Surface(
+                    color = Color(0xFFD6E4F3),
+                    shape = androidx.compose.foundation.shape.RoundedCornerShape(999.dp)
+                ) {
+                    Text(
+                        text = "Queue: ${queueCount.coerceAtLeast(0)}",
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+                        style = MaterialTheme.typography.labelMedium,
+                        color = Color(0xFF1E3A5F)
+                    )
+                }
+                Text(
+                    text = if (isRunning) "Background run active" else "Ready",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color(0xFF2F6E6A),
+                    fontWeight = FontWeight.Medium
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun RecentClassificationCard(
+    history: List<ClassificationHistoryEntry>,
+    expanded: Boolean,
+    onToggleExpanded: () -> Unit
+) {
+    val totalImages = history.sumOf { it.imageCount }
+    val avgTimeMs = if (history.isNotEmpty()) history.map { it.averageTimeMs }.average().toLong() else 0L
+    val success = history.sumOf { it.successCount }
+    val failed = history.sumOf { it.failedCount }
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFFF4FBF7)),
+        shape = androidx.compose.foundation.shape.RoundedCornerShape(16.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "Recent Classification",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = Color(0xFF102A43),
+                    fontWeight = FontWeight.SemiBold
+                )
+                TextButton(onClick = onToggleExpanded) {
+                    Text(if (expanded) "Hide" else "Expand")
+                }
+            }
+
+            if (history.isEmpty()) {
+                Text(
+                    text = "No classification activity yet.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color(0xFF4A6572)
+                )
+                return@Column
+            }
+
+            Text(
+                text = "Last ${history.size} runs | images: $totalImages | success: $success | failed: $failed | avg: ${formatMs(avgTimeMs)}",
+                style = MaterialTheme.typography.bodySmall,
+                color = Color(0xFF355C7D)
+            )
+
+            if (expanded) {
+                HorizontalDivider(color = Color(0xFFD6E4F3))
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    history.forEach { item ->
+                        Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = CardDefaults.cardColors(containerColor = Color(0xFFFFFFFF)),
+                            shape = androidx.compose.foundation.shape.RoundedCornerShape(12.dp)
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(10.dp),
+                                verticalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                Text(
+                                    text = "${item.source} • ${item.status}",
+                                    style = MaterialTheme.typography.labelLarge,
+                                    color = Color(0xFF1E3A5F),
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                                Text(
+                                    text = "${DateFormat.format("dd MMM, hh:mm:ss a", item.timestampMs)}",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = Color(0xFF4A6572)
+                                )
+                                Text(
+                                    text = "images: ${item.imageCount}, success: ${item.successCount}, failed: ${item.failedCount}, avg/run: ${formatMs(item.averageTimeMs)}",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = Color(0xFF355C7D)
+                                )
+                                if (item.note.isNotBlank()) {
+                                    Text(
+                                        text = "note: ${item.note}",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = Color(0xFF2F6E6A)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+private fun formatMs(value: Long): String {
+    if (value <= 0L) return "0 ms"
+    return if (value < 1000L) "$value ms" else "${"%.2f".format(value / 1000.0)} s"
+}
+
+@Composable
 private fun WelcomeSplashDialog(
     modelReady: Boolean,
     hasPhotoPermission: Boolean,
@@ -2026,7 +2161,7 @@ private fun CategoryCollectionGrid(
                         CategoryCollectionCard(
                             category = entry.key,
                             count = entry.value.size,
-                            previewUri = entry.value.firstOrNull()?.first?.uri,
+                            previewUri = entry.value.maxByOrNull { it.second.updatedAt }?.first?.uri,
                             isSelected = entry.key == selectedCategory,
                             onClick = { onCategoryClick(entry.key) }
                         )
