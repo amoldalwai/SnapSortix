@@ -1,6 +1,13 @@
-# Screenshot Sorter
+# SnapSortix
 
-An Android 12+ Kotlin app that scans screenshots, downloads Gemma 4 E2B on first use, and classifies images locally with LiteRT-LM.
+SnapSortix is an Android 12+ Kotlin app that scans screenshots, downloads Gemma 4 E2B on first use, and classifies images locally with LiteRT-LM.
+
+## Features
+
+- Auto-detect new screenshots in background
+- On-device screenshot classification with Gemma 4 E2B
+- Queue-based processing with progress updates
+- Local classification index persistence
 
 ## Development setup
 
@@ -13,6 +20,12 @@ gradle wrapper --gradle-version 8.10.2
 .\gradlew.bat assembleDebug
 .\gradlew.bat installDebug
 ```
+
+## APK
+
+The debug APK is published in this repository at:
+
+- `releases/SnapSortix-debug.apk`
 
 ## Model delivery
 

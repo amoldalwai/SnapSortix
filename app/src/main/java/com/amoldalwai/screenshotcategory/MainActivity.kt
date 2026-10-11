@@ -325,6 +325,7 @@ class MainActivity : ComponentActivity() {
         var showAllCategories by remember { mutableStateOf(false) }
         var showAllGallery by remember { mutableStateOf(false) }
         var selectedGalleryImage by remember { mutableStateOf<Screenshot?>(null) }
+        var isMetricsRefreshing by remember { mutableStateOf(false) }
         var isCategorySectionLoading by remember { mutableStateOf(true) }
         var isScreenshotSectionLoading by remember { mutableStateOf(true) }
         var selectedImageProfile by remember { mutableStateOf<Pair<Screenshot, ClassifiedImage>?>(null) }
@@ -479,6 +480,30 @@ class MainActivity : ComponentActivity() {
                 val backendCpuPercent = 50
                 val backendGpuPercent = 50
 
+                fun refreshMetrics() {
+                    if (isMetricsRefreshing) return
+                    if (ContextCompat.checkSelfPermission(
+                            this@MainActivity,
+                            Manifest.permission.READ_MEDIA_IMAGES
+                        ) != PackageManager.PERMISSION_GRANTED
+                    ) {
+                        status = "Image permission is required before refresh."
+                        return
+                    }
+                    isMetricsRefreshing = true
+                    status = "Refreshing screenshots..."
+                    lifecycleScope.launch {
+                        val cleaned = withContext(Dispatchers.IO) { pruneMissingClassifications(classifications) }
+                        classifications = cleaned
+                        loadScreenshots { loadedScreenshots ->
+                            val merged = mergeScreenshotsWithPersisted(loadedScreenshots, cleaned)
+                            screenshots = merged
+                            status = "Refreshed ${merged.size} images."
+                            isMetricsRefreshing = false
+                        }
+                    }
+                }
+
                 suspend fun classifyAndPersist(screenshot: Screenshot): Boolean {
                     val imageKey = uriKeyFor(screenshot.uri.toString())
                     activeClassification = imageKey
@@ -580,7 +605,7 @@ class MainActivity : ComponentActivity() {
                                 }
                             }
                             Text(
-                                "Screenshot Sorter",
+                                "SnapSortix",
                                 style = MaterialTheme.typography.headlineSmall,
                                 color = Color(0xFF102A43),
                                 fontWeight = FontWeight.SemiBold
@@ -683,7 +708,7 @@ class MainActivity : ComponentActivity() {
                         ) {
                             item {
                                 Text(
-                                    "AI SCREENSHOT ORGANIZER",
+                                    "SNAPSORTIX",
                                     color = Color(0xFF2F6E6A),
                                     style = MaterialTheme.typography.labelLarge,
                                     fontWeight = FontWeight.Bold
@@ -700,7 +725,9 @@ class MainActivity : ComponentActivity() {
                             item {
                                 HomeMetricsCard(
                                     classifiedCount = classifiedScreenshotsCount,
-                                    totalCount = totalScreenshotsCount
+                                    totalCount = totalScreenshotsCount,
+                                    isRefreshing = isMetricsRefreshing,
+                                    onRefresh = { refreshMetrics() }
                                 )
                             }
                             if (isBatchClassifying && batchTotal > 0) {
@@ -801,20 +828,6 @@ class MainActivity : ComponentActivity() {
                                                 style = MaterialTheme.typography.bodySmall,
                                                 color = Color(0xFF355C7D)
                                             )
-                                            if (runtimeBackend.isNotBlank()) {
-                                                Text(
-                                                    text = "Runtime in use: $runtimeBackend",
-                                                    style = MaterialTheme.typography.bodySmall,
-                                                    color = Color(0xFF1E3A5F)
-                                                )
-                                            }
-                                            if (activeVisionModeLabel.isNotBlank()) {
-                                                Text(
-                                                    text = "Mode: $activeVisionModeLabel | Token budget: $activeTokenBudget | Resize: ${activeResizeLongSidePx}px",
-                                                    style = MaterialTheme.typography.bodySmall,
-                                                    color = Color(0xFF1E3A5F)
-                                                )
-                                            }
                                             if (dominantStage.isNotBlank()) {
                                                 Text(
                                                     text = "Dominant stage: $dominantStage",
@@ -1138,30 +1151,6 @@ class MainActivity : ComponentActivity() {
                                     item {
                                         TextButton(onClick = { selectedGalleryImage = null }) {
                                             Text("Clear selected gallery image")
-                                        }
-                                    }
-                                }
-                                item {
-                                    Card(
-                                        modifier = Modifier.fillMaxWidth(),
-                                        shape = androidx.compose.foundation.shape.RoundedCornerShape(14.dp),
-                                        colors = CardDefaults.cardColors(containerColor = Color(0xFFEAF3F3))
-                                    ) {
-                                        Column(
-                                            modifier = Modifier.padding(14.dp),
-                                            verticalArrangement = Arrangement.spacedBy(6.dp)
-                                        ) {
-                                            Text(
-                                                text = "Home is focused on categories",
-                                                style = MaterialTheme.typography.titleSmall,
-                                                color = Color(0xFF102A43),
-                                                fontWeight = FontWeight.SemiBold
-                                            )
-                                            Text(
-                                                text = "Select a category or tap View All to browse screenshots.",
-                                                style = MaterialTheme.typography.bodyMedium,
-                                                color = Color(0xFF355C7D)
-                                            )
                                         }
                                     }
                                 }
@@ -1600,7 +1589,12 @@ private fun StatusCard(status: String) {
 }
 
 @Composable
-private fun HomeMetricsCard(classifiedCount: Int, totalCount: Int) {
+private fun HomeMetricsCard(
+    classifiedCount: Int,
+    totalCount: Int,
+    isRefreshing: Boolean,
+    onRefresh: () -> Unit
+) {
     val completionPercent = if (totalCount > 0) {
         (classifiedCount.toFloat() / totalCount.toFloat()).coerceIn(0f, 1f)
     } else {
@@ -1616,12 +1610,33 @@ private fun HomeMetricsCard(classifiedCount: Int, totalCount: Int) {
             modifier = Modifier.padding(14.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            Text(
-                text = "Classified screenshots",
-                style = MaterialTheme.typography.titleSmall,
-                color = Color(0xFF1E3A5F),
-                fontWeight = FontWeight.SemiBold
-            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "Classified screenshots",
+                    style = MaterialTheme.typography.titleSmall,
+                    color = Color(0xFF1E3A5F),
+                    fontWeight = FontWeight.SemiBold
+                )
+                IconButton(onClick = onRefresh, enabled = !isRefreshing) {
+                    if (isRefreshing) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(16.dp),
+                            strokeWidth = 2.dp,
+                            color = Color(0xFF2F6E6A)
+                        )
+                    } else {
+                        Icon(
+                            imageVector = Icons.Outlined.Refresh,
+                            contentDescription = "Refresh classified screenshot counts",
+                            tint = Color(0xFF1E3A5F)
+                        )
+                    }
+                }
+            }
             Text(
                 text = "$classifiedCount / $totalCount",
                 style = MaterialTheme.typography.headlineSmall,
@@ -1633,11 +1648,6 @@ private fun HomeMetricsCard(classifiedCount: Int, totalCount: Int) {
                 modifier = Modifier.fillMaxWidth(),
                 color = Color(0xFF2F6E6A),
                 trackColor = Color(0xFFD6E4F3)
-            )
-            Text(
-                text = "Only currently available screenshots are counted.",
-                style = MaterialTheme.typography.bodySmall,
-                color = Color(0xFF355C7D)
             )
         }
     }
