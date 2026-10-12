@@ -39,6 +39,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowDropDown
@@ -104,6 +106,7 @@ import java.io.File
 
 class MainActivity : ComponentActivity() {
     private var classifier: GemmaClassifier? = null
+    private var ocrEngine: MlKitOcrEngine? = null
     private val preferences by lazy { getSharedPreferences("screenshot_sorter", MODE_PRIVATE) }
     private val classificationStoreFile by lazy { File(filesDir, CLASSIFICATION_STORE_FILE_NAME) }
     private val classificationHistoryStoreFile by lazy { File(filesDir, CLASSIFICATION_HISTORY_FILE_NAME) }
@@ -117,6 +120,8 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         classifier?.close()
         classifier = null
+        ocrEngine?.close()
+        ocrEngine = null
         super.onDestroy()
     }
 
@@ -197,6 +202,19 @@ class MainActivity : ComponentActivity() {
                             category = item.optString("category").ifBlank { "Others" },
                             confidence = confidence,
                             description = item.optString("description").orEmpty(),
+                            ocrText = item.optString("ocrText").orEmpty(),
+                            ocrStatus = item.optString("ocrStatus").ifBlank { "unknown" },
+                            ocrEngine = item.optString("ocrEngine").ifBlank { "mlkit_bundled" },
+                            ocrProcessedAtMs = if (item.has("ocrProcessedAtMs") && !item.isNull("ocrProcessedAtMs")) {
+                                item.optLong("ocrProcessedAtMs")
+                            } else {
+                                null
+                            },
+                            ocrDurationMs = if (item.has("ocrDurationMs") && !item.isNull("ocrDurationMs")) {
+                                item.optLong("ocrDurationMs")
+                            } else {
+                                null
+                            },
                             updatedAt = item.optLong("updatedAt", 0L)
                         )
                     )
@@ -216,6 +234,11 @@ class MainActivity : ComponentActivity() {
                     put("category", classification.category)
                     put("confidence", classification.confidence)
                     put("description", classification.description)
+                    put("ocrText", classification.ocrText)
+                    put("ocrStatus", classification.ocrStatus)
+                    put("ocrEngine", classification.ocrEngine)
+                    put("ocrProcessedAtMs", classification.ocrProcessedAtMs ?: JSONObject.NULL)
+                    put("ocrDurationMs", classification.ocrDurationMs ?: JSONObject.NULL)
                     put("updatedAt", classification.updatedAt)
                 }
             )
@@ -542,16 +565,19 @@ class MainActivity : ComponentActivity() {
                                 this@MainActivity,
                                 modelDownload.modelFile
                             ).also { classifier = it }
-                            activeClassifier.classify(
+                            val activeOcr = ocrEngine ?: MlKitOcrEngine(this@MainActivity).also { ocrEngine = it }
+                            val classification = activeClassifier.classify(
                                 screenshot.uri,
                                 savedCategories,
                                 savedCustomPrompt,
                                 savedVisionMode
                             )
+                            val ocrResult = activeOcr.extractText(screenshot.uri)
+                            classification to ocrResult
                         }
                     }
                     activeClassification = null
-                    return result.map { classification ->
+                    return result.map { (classification, ocrResult) ->
                         val savedEntry = ClassifiedImage(
                             imageId = screenshot.imageId,
                             imageUri = screenshot.uri.toString(),
@@ -559,6 +585,11 @@ class MainActivity : ComponentActivity() {
                             category = classification.category,
                             confidence = classification.confidence,
                             description = classification.description,
+                            ocrText = ocrResult.text,
+                            ocrStatus = ocrResult.status,
+                            ocrEngine = "mlkit_bundled",
+                            ocrProcessedAtMs = System.currentTimeMillis(),
+                            ocrDurationMs = ocrResult.durationMs,
                             updatedAt = System.currentTimeMillis()
                         )
                         val updated = classifications + (imageKey to savedEntry)
@@ -1210,14 +1241,24 @@ class MainActivity : ComponentActivity() {
                     }
                     }
 
-                    selectedImageProfile?.let { (screenshot, details) ->
+                        selectedImageProfile?.let { (screenshot, details) ->
+                        val sameCategoryItems = screenshots.mapNotNull { shot ->
+                            val classified = classifications[uriKeyFor(shot.uri.toString())] ?: return@mapNotNull null
+                            if (classified.category != details.category) return@mapNotNull null
+                            shot to classified
+                        }.sortedByDescending { it.second.updatedAt }
+
+                        val initialProfileIndex = sameCategoryItems.indexOfFirst {
+                            uriKeyFor(it.first.uri.toString()) == uriKeyFor(screenshot.uri.toString())
+                        }.coerceAtLeast(0)
+
                         ImageProfileDialog(
-                            screenshot = screenshot,
-                            details = details,
+                            items = sameCategoryItems,
+                            initialIndex = initialProfileIndex,
                             categories = savedCategories,
-                            isReclassifying = activeReclassification == uriKeyFor(screenshot.uri.toString()),
-                            onSaveEdits = { updatedCategory, updatedDescription ->
-                                val imageKey = uriKeyFor(screenshot.uri.toString())
+                            activeReclassification = activeReclassification,
+                            onSaveEdits = { targetScreenshot, updatedCategory, updatedDescription ->
+                                val imageKey = uriKeyFor(targetScreenshot.uri.toString())
                                 val existing = classifications[imageKey] ?: return@ImageProfileDialog false
                                 val updatedEntry = existing.copy(
                                     category = updatedCategory,
@@ -1247,25 +1288,25 @@ class MainActivity : ComponentActivity() {
                                     classificationHistoryStoreFile,
                                     limit = MAX_CLASSIFICATION_HISTORY_ENTRIES
                                 )
-                                status = "Updated classification for ${screenshot.displayName}."
-                                selectedImageProfile = screenshot to updatedEntry
+                                status = "Updated classification for ${targetScreenshot.displayName}."
+                                selectedImageProfile = targetScreenshot to updatedEntry
                                 true
                             },
-                            onReclassify = {
+                            onReclassify = { targetScreenshot ->
                                 lifecycleScope.launch {
-                                    val imageKey = uriKeyFor(screenshot.uri.toString())
+                                    val imageKey = uriKeyFor(targetScreenshot.uri.toString())
                                     activeReclassification = imageKey
                                     status = if (classifier == null) {
                                         "Preparing Gemma for re-classification."
                                     } else {
-                                        "Re-classifying ${screenshot.displayName} with latest prompt..."
+                                        "Re-classifying ${targetScreenshot.displayName} with latest prompt..."
                                     }
-                                    val savedToDisk = classifyAndPersist(screenshot, source = "Gallery reclassify")
+                                    val savedToDisk = classifyAndPersist(targetScreenshot, source = "Gallery reclassify")
                                     activeReclassification = null
                                     if (savedToDisk) {
-                                        val latest = classifications[uriKeyFor(screenshot.uri.toString())]
+                                        val latest = classifications[uriKeyFor(targetScreenshot.uri.toString())]
                                         if (latest != null) {
-                                            selectedImageProfile = screenshot to latest
+                                            selectedImageProfile = targetScreenshot to latest
                                         }
                                         status = "Re-classification finished. Category has been updated."
                                     } else {
@@ -1276,8 +1317,7 @@ class MainActivity : ComponentActivity() {
                             onDismiss = { selectedImageProfile = null }
                         )
                     }
-
-                    if (showDeleteAllClassificationsDialog) {
+if (showDeleteAllClassificationsDialog) {
                         AlertDialog(
                             onDismissRequest = { showDeleteAllClassificationsDialog = false },
                             title = { Text("Delete all classifications?") },
@@ -1373,6 +1413,11 @@ private data class ClassifiedImage(
     val category: String,
     val confidence: Float,
     val description: String,
+    val ocrText: String,
+    val ocrStatus: String,
+    val ocrEngine: String,
+    val ocrProcessedAtMs: Long?,
+    val ocrDurationMs: Long?,
     val updatedAt: Long
 ) {
     fun toClassification(): Classification = Classification(
@@ -2305,46 +2350,46 @@ private fun CategoryImageGrid(
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun ImageProfileDialog(
-    screenshot: Screenshot,
-    details: ClassifiedImage,
+    items: List<Pair<Screenshot, ClassifiedImage>>,
+    initialIndex: Int,
     categories: List<String>,
-    isReclassifying: Boolean,
-    onSaveEdits: (String, String) -> Boolean,
-    onReclassify: () -> Unit,
+    activeReclassification: UriKey?,
+    onSaveEdits: (Screenshot, String, String) -> Boolean,
+    onReclassify: (Screenshot) -> Unit,
     onDismiss: () -> Unit
 ) {
+    if (items.isEmpty()) {
+        AlertDialog(
+            onDismissRequest = onDismiss,
+            title = { Text("Image profile") },
+            text = { Text("No classified image available in this category.") },
+            confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } }
+        )
+        return
+    }
+
+    val pagerState = rememberPagerState(
+        initialPage = initialIndex.coerceIn(0, items.lastIndex),
+        pageCount = { items.size }
+    )
+
+    val currentItem = items[pagerState.currentPage]
+    val screenshot = currentItem.first
+    val details = currentItem.second
+    val isReclassifying = activeReclassification != null
+
     var isEditing by remember { mutableStateOf(false) }
-    var draftCategory by remember(details.category, categories) {
+    var draftCategory by remember(pagerState.currentPage, details.category, categories) {
         mutableStateOf(
             categories.firstOrNull { it.equals(details.category, ignoreCase = true) }
                 ?: categories.firstOrNull()
                 ?: details.category
         )
     }
-    var draftDescription by remember(details.description) { mutableStateOf(details.description) }
+    var draftDescription by remember(pagerState.currentPage, details.description) { mutableStateOf(details.description) }
     var showCategoryMenu by remember { mutableStateOf(false) }
-    var showFullImagePreview by remember { mutableStateOf(false) }
-
-    if (showFullImagePreview) {
-        Dialog(onDismissRequest = { showFullImagePreview = false }) {
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .background(Color(0xE6000000))
-                    .clickable { showFullImagePreview = false },
-                contentAlignment = Alignment.Center
-            ) {
-                AsyncImage(
-                    model = screenshot.uri,
-                    contentDescription = screenshot.displayName,
-                    contentScale = ContentScale.Fit,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(16.dp)
-                )
-            }
-        }
-    }
+    var showOcrText by remember(pagerState.currentPage, details.ocrText) { mutableStateOf(false) }
+    var showFullPreview by remember { mutableStateOf(false) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -2362,7 +2407,7 @@ private fun ImageProfileDialog(
                         Text("Cancel")
                     }
                     TextButton(onClick = {
-                        val saved = onSaveEdits(draftCategory, draftDescription)
+                        val saved = onSaveEdits(screenshot, draftCategory, draftDescription)
                         if (saved) {
                             isEditing = false
                             showCategoryMenu = false
@@ -2404,7 +2449,7 @@ private fun ImageProfileDialog(
                 }
                 IconButton(onClick = {
                     showCategoryMenu = false
-                    onReclassify()
+                    onReclassify(screenshot)
                 }, enabled = !isReclassifying) {
                     if (isReclassifying) {
                         CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
@@ -2419,7 +2464,7 @@ private fun ImageProfileDialog(
             }
         },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 if (isReclassifying) {
                     LinearProgressIndicator(
                         modifier = Modifier.fillMaxWidth(),
@@ -2433,21 +2478,38 @@ private fun ImageProfileDialog(
                         fontWeight = FontWeight.Medium
                     )
                 }
-                AsyncImage(
-                    model = screenshot.uri,
-                    contentDescription = screenshot.displayName,
-                    contentScale = ContentScale.Fit,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(190.dp)
-                        .clickable { showFullImagePreview = true }
-                        .clip(androidx.compose.foundation.shape.RoundedCornerShape(14.dp))
-                )
-                Text(
-                    text = "Tap image to preview full size",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = Color(0xFF4A6572)
-                )
+
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = androidx.compose.foundation.shape.RoundedCornerShape(14.dp),
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFFF3F8FF))
+                ) {
+                    Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        HorizontalPager(state = pagerState) { page ->
+                            val pageShot = items[page].first
+                            AsyncImage(
+                                model = pageShot.uri,
+                                contentDescription = pageShot.displayName,
+                                contentScale = ContentScale.Crop,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(210.dp)
+                                    .clip(androidx.compose.foundation.shape.RoundedCornerShape(12.dp))
+                                    .clickable { showFullPreview = true }
+                            )
+                        }
+                        Text(
+                            text = "${pagerState.currentPage + 1} of ${items.size} in ${details.category}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = Color(0xFF4A6572)
+                        )
+                        Text(
+                            text = "Swipe left / right",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = Color(0xFF2F6E6A)
+                        )
+                    }
+                }
 
                 Surface(
                     color = categoryColor(if (isEditing) draftCategory.trim().ifBlank { details.category } else details.category),
@@ -2460,8 +2522,6 @@ private fun ImageProfileDialog(
                         modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
                     )
                 }
-
-                Text("Confidence: ${((details.confidence * 100).toInt())}%")
 
                 if (isEditing) {
                     ExposedDropdownMenuBox(
@@ -2507,9 +2567,62 @@ private fun ImageProfileDialog(
                     Text("Description: ${details.description}")
                 }
 
+                if (details.ocrStatus.equals("success", ignoreCase = true) && details.ocrText.isNotBlank()) {
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.cardColors(containerColor = Color(0xFFEAF0FF)),
+                        shape = androidx.compose.foundation.shape.RoundedCornerShape(12.dp)
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(12.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable { showOcrText = !showOcrText },
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "Extracted text (Accordion)",
+                                    style = MaterialTheme.typography.titleSmall,
+                                    color = Color(0xFF2D3F77),
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                                Icon(
+                                    imageVector = Icons.Default.ArrowDropDown,
+                                    contentDescription = "Toggle extracted text",
+                                    tint = Color(0xFF5567D8)
+                                )
+                            }
+                            Text(
+                                text = if (showOcrText) "Tap header to collapse" else "Tap header to expand",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = Color(0xFF6177A8)
+                            )
+                            if (showOcrText) {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(220.dp)
+                                        .clip(androidx.compose.foundation.shape.RoundedCornerShape(10.dp))
+                                        .background(Color(0xFFF7FAFF))
+                                        .padding(10.dp)
+                                        .verticalScroll(rememberScrollState())
+                                ) {
+                                    Text(
+                                        text = details.ocrText,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = Color(0xFF344B84)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
                 HorizontalDivider(color = Color(0xFFE2E8F0))
-                Text("Image id: ${details.imageId}", style = MaterialTheme.typography.bodySmall)
-                Text("URI: ${details.imageUri}", style = MaterialTheme.typography.bodySmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
                 Text(
                     "Updated: ${DateFormat.format("dd MMM yyyy, hh:mm a", details.updatedAt)}",
                     style = MaterialTheme.typography.bodySmall,
@@ -2518,8 +2631,25 @@ private fun ImageProfileDialog(
             }
         }
     )
-}
 
+    if (showFullPreview) {
+        Dialog(onDismissRequest = { showFullPreview = false }) {
+            Surface(shape = androidx.compose.foundation.shape.RoundedCornerShape(16.dp)) {
+                HorizontalPager(state = pagerState) { page ->
+                    val pageScreenshot = items[page].first
+                    AsyncImage(
+                        model = pageScreenshot.uri,
+                        contentDescription = pageScreenshot.displayName,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(420.dp),
+                        contentScale = ContentScale.Fit
+                    )
+                }
+            }
+        }
+    }
+}
 @Composable
 private fun CategoryCollectionSkeleton() {
     val shimmer = rememberInfiniteTransition(label = "categorySkeleton")
@@ -2768,3 +2898,6 @@ private val categoryColors = listOf(
 
 private fun categoryColor(category: String): Color =
     categoryColors[(category.hashCode() and Int.MAX_VALUE) % categoryColors.size]
+
+
+

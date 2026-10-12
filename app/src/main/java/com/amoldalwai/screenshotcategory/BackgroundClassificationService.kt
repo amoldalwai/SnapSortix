@@ -35,6 +35,7 @@ class BackgroundClassificationService : Service() {
     private var debounceJob: Job? = null
     private var fallbackScanJob: Job? = null
     private var classifier: GemmaClassifier? = null
+    private var ocrEngine: MlKitOcrEngine? = null
     private var mediaObserver: ContentObserver? = null
     private val queuedScreenshots = ArrayDeque<Screenshot>()
     private val queuedUris = HashSet<String>()
@@ -115,6 +116,8 @@ class BackgroundClassificationService : Service() {
         unregisterScreenshotObserver()
         classifier?.close()
         classifier = null
+        ocrEngine?.close()
+        ocrEngine = null
         isRunning = false
         isBatchRunning = false
         isWatcherRunning = false
@@ -461,6 +464,7 @@ class BackgroundClassificationService : Service() {
             it.warmUp()
             Log.i(TAG, "Watcher classifier warm-up complete")
         }
+        val activeOcr = ocrEngine ?: MlKitOcrEngine(this).also { ocrEngine = it }
 
         var done = 0
         var failed = 0
@@ -500,6 +504,7 @@ class BackgroundClassificationService : Service() {
                 totalInferenceMs += result.inferenceMs
                 runtimeBackend = result.runtimeProfileLabel
                 retryAttemptsByUri.remove(uriValue)
+                val ocrResult = activeOcr.extractText(screenshot.uri)
 
                 val savedEntry = JSONObject().apply {
                     put("imageId", screenshot.imageId)
@@ -508,6 +513,11 @@ class BackgroundClassificationService : Service() {
                     put("category", result.classification.category)
                     put("confidence", result.classification.confidence)
                     put("description", result.classification.description)
+                    put("ocrText", ocrResult.text)
+                    put("ocrStatus", ocrResult.status)
+                    put("ocrEngine", "mlkit_bundled")
+                    put("ocrProcessedAtMs", System.currentTimeMillis())
+                    put("ocrDurationMs", ocrResult.durationMs)
                     put("updatedAt", System.currentTimeMillis())
                 }
                 existing[canonicalizeMediaStoreUriKey(screenshot.uri.toString())] = savedEntry
@@ -696,6 +706,7 @@ class BackgroundClassificationService : Service() {
             classifier = it
             it.warmUp()
         }
+        val activeOcr = ocrEngine ?: MlKitOcrEngine(this).also { ocrEngine = it }
 
         var done = 0
         var failed = 0
@@ -728,6 +739,7 @@ class BackgroundClassificationService : Service() {
                     totalDecodeMs += result.decodeDownscaleMs
                     totalInferenceMs += result.inferenceMs
                     runtimeBackend = result.runtimeProfileLabel
+                    val ocrResult = activeOcr.extractText(screenshot.uri)
                     val savedEntry = JSONObject().apply {
                         put("imageId", screenshot.imageId)
                         put("imageUri", screenshot.uri.toString())
@@ -735,6 +747,11 @@ class BackgroundClassificationService : Service() {
                         put("category", result.classification.category)
                         put("confidence", result.classification.confidence)
                         put("description", result.classification.description)
+                        put("ocrText", ocrResult.text)
+                        put("ocrStatus", ocrResult.status)
+                        put("ocrEngine", "mlkit_bundled")
+                        put("ocrProcessedAtMs", System.currentTimeMillis())
+                        put("ocrDurationMs", ocrResult.durationMs)
                         put("updatedAt", System.currentTimeMillis())
                     }
                     existing[canonicalizeMediaStoreUriKey(screenshot.uri.toString())] = savedEntry
